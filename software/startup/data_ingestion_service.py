@@ -1,16 +1,15 @@
 import traceback
-import requests
 import logging
 import time
-import pandas as pd
 from config.config import config_logger, load_config
 from communication.rpc_server import RPCServer
 from communication.mongodb import MongoDB
 from communication.protocol import ROUTING_KEY_STM_TELEMETRY_VALIDATION, ROUTING_KEY_STM_BUS_ROUTE_UPDATES, STM_API_URL, STM_API_HEADER, EXECUTION_INTERVAL
-from google.transit.gtfs_realtime_pb2 import FeedMessage
-from protobuf_to_dict import protobuf_to_dict
+from communication.stm_api import fetch_feed, extract_timestamp, filter_vehicle_entities, flatten_entities
 
 config_logger("config/logging.conf")
+# fileConfig disables the loggers that already exist; this one was created when communication.stm_api was imported
+logging.getLogger("StmApi").disabled = False
 
 def to_queue_format(_bytes) -> dict:
 
@@ -21,10 +20,7 @@ def to_queue_format(_bytes) -> dict:
     }
 
 def flatten_response(data:list[dict]) -> list[dict]:
-    flatten_data = []
-    for entity in data:
-        flatten_data.append(pd.json_normalize(entity).T.to_dict()[0])
-    return flatten_data
+    return flatten_entities(data)
 
 class DataIngestionService(RPCServer):
 
@@ -59,38 +55,20 @@ class DataIngestionService(RPCServer):
 
 
     def extract_timestamp(self, _data:dict) -> int:
-        try:
-            return int(_data['vehicle']['timestamp'])
-        except KeyError as e:
-            self.logger.error(f"Error at extracting timestamp: {str(e)}")
-            return 0
+        return extract_timestamp(_data)
 
 
     def fetch_bus_route_data(self):
-        feed = FeedMessage()
-        response = requests.get(self.url, headers=self.headers)
-        feed.ParseFromString(response.content)
-        return feed
+        return fetch_feed(self.url, self.headers)
 
 
     def process_response(self, feed, route_ids:list[int]=None, sort:bool=True, flatten:bool=True) -> list[dict]:
-        data = []
-        # Convert to dictionary from the original protobuf feed
-        feed_dict = protobuf_to_dict(feed)
-
         if not route_ids:
             route_ids = []
         self.logger.info(f"Processing response for bus routes: {route_ids}")
 
-        for entity in feed_dict['entity']:
-            if 'vehicle' in entity and 'trip' in entity['vehicle'] and 'route_id' in entity['vehicle']['trip']:
-                self.logger.debug(f"Retrieved entity: {entity}")
-
-                route_id = int(entity['vehicle']['trip']['route_id'])
-                if (not route_ids) or (route_id in route_ids) :
-                    data.append(entity)
-        if sort:
-            data.sort(key=self.extract_timestamp, reverse=True)
+        # Filtering, sorting and flattening are shared with the recorder (communication/stm_api.py)
+        data = filter_vehicle_entities(feed, route_ids, sort)
 
         if flatten:
             data = flatten_response(data)

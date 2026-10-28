@@ -6,6 +6,20 @@ var key_point_scene = preload("res://key_point.tscn")
 const EARTH_RADIUS = 6367299.7229714
 @onready var reference_points: Array[Node] = $ReferencePoints.get_children()
 
+# Reference points copied into flat arrays: reading node properties is slow, and the
+# triangulation runs for every moving bus on every frame
+var _ref_lat := PackedFloat64Array()
+var _ref_lon := PackedFloat64Array()
+var _ref_x := PackedFloat64Array()
+var _ref_z := PackedFloat64Array()
+
+func _ready():
+	for point in reference_points:
+		_ref_lat.append(point.latitude)
+		_ref_lon.append(point.longitude)
+		_ref_x.append(point.global_position.x)
+		_ref_z.append(point.global_position.z)
+
 func latlong_to_2d(longitude: float, latitude: float, ref_longitude: float, ref_latitude: float) -> Vector2:
 	var ref_longitude_rad = deg_to_rad(ref_longitude)
 	var ref_latitude_rad = deg_to_rad(ref_latitude)
@@ -64,19 +78,24 @@ func get_position_by_closest(latitude, longitude) -> Vector2:
 	return latlong_to_2d(longitude, latitude, closest_reference_point.longitude, closest_reference_point.latitude)
 
 func get_position_by_closest_triangulation(latitude, longitude) -> Vector2:
-	var closest_points: Array = []
-	
-	# Find the three closest points
-	for point in reference_points:
-		var distance = pow(point.latitude - latitude, 2) + pow(point.longitude - longitude, 2)
-		closest_points.append({"point": point, "distance": distance})
-	
-	closest_points.sort_custom(func(a, b): return a["distance"] < b["distance"])
-	closest_points = closest_points.slice(0, 3)  # Keep only the three closest points
-	
+	# Find the three closest points in one pass (no per-call sort)
+	var closest: Array = [-1, -1, -1]
+	var closest_distances: Array = [INF, INF, INF]
+	for index in _ref_lat.size():
+		var delta_lat = _ref_lat[index] - latitude
+		var delta_lon = _ref_lon[index] - longitude
+		var distance = delta_lat * delta_lat + delta_lon * delta_lon
+		for i in range(3):
+			if distance < closest_distances[i]:
+				closest.insert(i, index)
+				closest_distances.insert(i, distance)
+				closest.resize(3)
+				closest_distances.resize(3)
+				break
+
 	var refs = []
 	for i in range(3):
-		var point: Node3D = closest_points[i]["point"]
-		refs.append({'lat': point.latitude, 'lon': point.longitude, 'x': point.global_position.x, 'z': point.global_position.z})	
-	
+		var index: int = closest[i]
+		refs.append({'lat': _ref_lat[index], 'lon': _ref_lon[index], 'x': _ref_x[index], 'z': _ref_z[index]})
+
 	return interpolate_latlon_to_2d(latitude, longitude, refs)

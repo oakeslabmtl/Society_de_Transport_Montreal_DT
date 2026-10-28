@@ -1,4 +1,4 @@
-[gd_scene load_steps=11 format=3 uid="uid://c71j6ed8bjn6u"]
+[gd_scene load_steps=10 format=3 uid="uid://c71j6ed8bjn6u"]
 
 [ext_resource type="Script" uid="uid://6oogno61bml1" path="res://scripts/main.gd" id="1_sq1r5"]
 [ext_resource type="Script" uid="uid://dlikhv88p4p40" path="res://RabbitMQListener.cs" id="2_fk53w"]
@@ -6,7 +6,6 @@
 [ext_resource type="PackedScene" uid="uid://x153n1ajrncp" path="res://assets/map not joined.glb" id="3_r0du0"]
 [ext_resource type="Script" uid="uid://pirbfucr43t7" path="res://scripts/map_interpolation.gd" id="4_cm0pq"]
 [ext_resource type="PackedScene" uid="uid://bwl3767nrqrda" path="res://reference_point.tscn" id="5_fos0i"]
-[ext_resource type="Script" uid="uid://de17p8xaxkex3" path="res://scripts/ControlScript.gd" id="7_lgr22"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_5y3g4"]
 sky_horizon_color = Color(0.64625, 0.65575, 0.67075, 1)
@@ -55,6 +54,7 @@ transform = Transform3D(0.00162083, 0, 0, 0, 0.00162083, 0, 0, 0, 0.00162083, -4
 script = ExtResource("4_cm0pq")
 
 [node name="ReferencePoints" type="Node3D" parent="MapInterpolation"]
+visible = false
 
 [node name="ReferencePoint" parent="MapInterpolation/ReferencePoints" instance=ExtResource("5_fos0i")]
 latitude = 45.5086
@@ -113,7 +113,7 @@ longitude = -73.5736
 [node name="ReferencePoint12" parent="MapInterpolation/ReferencePoints" instance=ExtResource("5_fos0i")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 296.493, -0.137743, -83.1038)
 latitude = 45.5097
-longitude = -73.0
+longitude = -73.5701
 
 [node name="ReferencePoint13" parent="MapInterpolation/ReferencePoints" instance=ExtResource("5_fos0i")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -351.479, 34.0087, 269.112)
@@ -131,89 +131,3 @@ latitude = 45.5142
 longitude = -73.5852
 
 [node name="BusStops" type="Node3D" parent="."]
-
-[node name="Controls" type="ColorRect" parent="."]
-anchors_preset = 1
-anchor_left = 1.0
-anchor_right = 1.0
-offset_left = -259.0
-offset_top = 22.0
-offset_right = -24.0
-offset_bottom = 316.0
-grow_horizontal = 0
-color = Color(0.08, 0.08, 0.08, 0.662745)
-
-[node name="VBox" type="VBoxContainer" parent="Controls"]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
-script = ExtResource("7_lgr22")
-
-[node name="RichTextLabel" type="RichTextLabel" parent="Controls/VBox"]
-layout_mode = 2
-text = "Controls"
-fit_content = true
-horizontal_alignment = 1
-
-[node name="HSeparator" type="HSeparator" parent="Controls/VBox"]
-layout_mode = 2
-
-[node name="ReferencePointstoggle" type="CheckButton" parent="Controls/VBox"]
-layout_mode = 2
-focus_mode = 0
-button_pressed = true
-text = "Enable Reference Points"
-
-[node name="BusStopsToggle" type="CheckButton" parent="Controls/VBox"]
-layout_mode = 2
-size_flags_horizontal = 3
-size_flags_vertical = 0
-focus_mode = 0
-button_pressed = true
-text = "Enable Bus Stops"
-
-[node name="RoutesSubscribed" type="RichTextLabel" parent="Controls/VBox"]
-unique_name_in_owner = true
-layout_mode = 2
-focus_mode = 2
-text = "Currently subscribed routes: "
-fit_content = true
-selection_enabled = true
-
-[node name="AddRoutes" type="HBoxContainer" parent="Controls/VBox"]
-layout_mode = 2
-
-[node name="AddRoutesText" type="LineEdit" parent="Controls/VBox/AddRoutes"]
-unique_name_in_owner = true
-layout_mode = 2
-size_flags_horizontal = 3
-focus_mode = 1
-placeholder_text = "e.g.: 121, 24, 45"
-
-[node name="Button" type="Button" parent="Controls/VBox/AddRoutes"]
-layout_mode = 2
-focus_mode = 0
-text = "Add"
-
-[node name="RemoveRoutes" type="HBoxContainer" parent="Controls/VBox"]
-layout_mode = 2
-
-[node name="RemoveRoutesText" type="LineEdit" parent="Controls/VBox/RemoveRoutes"]
-unique_name_in_owner = true
-layout_mode = 2
-size_flags_horizontal = 3
-focus_mode = 1
-placeholder_text = "e.g.: 121, 24, 45"
-
-[node name="Button" type="Button" parent="Controls/VBox/RemoveRoutes"]
-layout_mode = 2
-focus_mode = 0
-text = "Remove"
-
-[connection signal="toggled" from="Controls/VBox/ReferencePointstoggle" to="." method="toggle_reference_points"]
-[connection signal="toggled" from="Controls/VBox/BusStopsToggle" to="." method="toggle_bus_stops"]
-[connection signal="pressed" from="Controls/VBox/AddRoutes/Button" to="." method="add_to_subscribed_routes"]
-[connection signal="pressed" from="Controls/VBox/RemoveRoutes/Button" to="." method="remove_from_subscribed_routes"]

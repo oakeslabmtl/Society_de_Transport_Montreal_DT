@@ -173,3 +173,10 @@ cython_debug/
 .idea/
 *.conf
 !services/configs/*.conf
+
+# Record & replay: demo build output (build_demo.bat) and local recordings
+# (CSV imports are regenerable; live `record` captures are not: keep a copy, see README)
+/visualization/Build/
+/recordings/
+# Separate environment for `python software/recording forecast` (Timestral + PyTorch, see the README)
+/.venv-forecast/
