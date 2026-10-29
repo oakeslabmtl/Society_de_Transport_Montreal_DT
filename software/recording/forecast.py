@@ -79,6 +79,19 @@ class ForecastSettings:
     point_every: float | None = None    # must be a multiple of the poll interval; None: 30 s, rounded to one
 
 
+@dataclass(frozen=True)
+class CalibrationSettings:
+    """Walk-forward calibration of the stored forecast (see Calibrator); below the thresholds, raw Timestral is kept."""
+    enabled: bool = True
+    min_points: int = 200               # past forecasts with a known outcome a horizon needs before it is calibrated
+    min_buses: int = 20                 # ... from at least this many buses
+    cell_min_points: int = 100          # for a horizon's range offsets of its own per status at the forecast time
+    cell_min_buses: int = 10
+
+
+RANGE_TAIL = 0.9                        # each end of the 80% range is calibrated so it holds 90% of past outcomes
+
+
 @dataclass
 class OccupancyGrid:
     """Occupancy of every vehicle on a regular grid of `step` seconds; slot 0 is the first frame."""
@@ -133,6 +146,88 @@ class ForecastResult:
     @property
     def metrics(self) -> dict:
         return self.forecast["metrics"]
+
+    @property
+    def metrics_raw(self) -> dict | None:
+        """Scores of the uncalibrated model output (None when nothing was calibrated)."""
+        return self.forecast.get("metrics_raw")
+
+
+class Calibrator:
+    """Walk-forward calibration of the model's forecasts, one horizon (forecast point) at a time.
+
+    Before the forecasts of an origin are made, each horizon is fitted on the past forecasts of that horizon whose
+    outcome is already known (target time <= the origin), so a stored forecast never uses what happened after it.
+      - Median: L + w * (model median - L), L the rank at the forecast time. w in [0, 1] is the least-squares weight of
+        the model's predicted move against the moves that happened: how much the model's moves can be trusted.
+      - 80% range: widened (never narrowed) by split conformal offsets, so that each end held 90% of past outcomes;
+        per rank at the forecast time when that rank has enough examples, else for the whole horizon.
+    A horizon with too few examples keeps the raw model output.
+    """
+
+    def __init__(self, points:int, top_rank:int, settings:CalibrationSettings):
+        self.points, self.top, self.settings = points, top_rank, settings
+        # Per horizon, chunks of past examples: target slot, vehicle number, rank at the origin, raw median, low and
+        # high, and the observed rank at the target (read when added: the target-slot filter of fit() keeps it unseen)
+        self._chunks = [[] for _ in range(points)]
+        self._vehicle_numbers: dict[str, int] = {}
+        self.params: list[dict | None] = [None] * points
+
+    def add(self, vehicle:str, target_slots:np.ndarray, rank:float, raw:np.ndarray, observed:np.ndarray):
+        """Records a raw forecast (Q x points, low/median/high) and the observed ranks of its points (NaN: unknown)."""
+        number = self._vehicle_numbers.setdefault(vehicle, len(self._vehicle_numbers))
+        for h in np.nonzero(np.isfinite(observed))[0]:
+            self._chunks[h].append((target_slots[h], number, rank, raw[1][h], raw[0][h], raw[2][h], observed[h]))
+
+    def fit(self, origin_slot:int):
+        """Fits every horizon on its examples whose target slot is <= origin_slot (self.params[h], None: raw)."""
+        for h in range(self.points):
+            self.params[h] = None
+            if not self.settings.enabled or not self._chunks[h]:
+                continue
+            target, vehicle, rank, median, low, high, observed = (np.array(column) for column in zip(*self._chunks[h]))
+            past = target <= origin_slot
+            n, buses = int(past.sum()), int(np.unique(vehicle[past]).size)
+            if n < self.settings.min_points or buses < self.settings.min_buses:
+                continue
+            rank, median, low, high, observed, vehicle = (a[past] for a in (rank, median, low, high, observed, vehicle))
+            move, happened = median - rank, observed - rank
+            sxx = float((move * move).sum())
+            weight = float(np.clip((move * happened).sum() / sxx, 0.0, 1.0)) if sxx > 0 else 0.0
+            low_score, high_score = low - observed, observed - high
+            offsets = [(conformal_offset(low_score), conformal_offset(high_score))] * (self.top + 1)
+            for r in range(self.top + 1):
+                cell = rank == r
+                if cell.sum() >= self.settings.cell_min_points and \
+                        np.unique(vehicle[cell]).size >= self.settings.cell_min_buses:
+                    offsets[r] = (conformal_offset(low_score[cell]), conformal_offset(high_score[cell]))
+            self.params[h] = {"examples": n, "buses": buses, "w": weight, "offsets": offsets}
+
+    def apply(self, rank:float, raw:np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(stored low/median/high rows, calibrated flag per point) for a raw forecast made at the last fit()."""
+        stored, calibrated = raw.copy(), np.zeros(self.points, dtype=bool)
+        r = int(rank)
+        for h, params in enumerate(self.params):
+            if params is None:
+                continue
+            low_offset, high_offset = params["offsets"][r]
+            median = round(float(np.clip(rank + params["w"] * (raw[1][h] - rank), 0, self.top)), 2)
+            # Not sorted: low <= median <= high by construction (sorting would swap the median with a range end)
+            stored[0][h] = round(float(np.clip(min(raw[0][h] - low_offset, median), 0, self.top)), 2)
+            stored[1][h] = median
+            stored[2][h] = round(float(np.clip(max(raw[2][h] + high_offset, median), 0, self.top)), 2)
+            calibrated[h] = True
+        return stored, calibrated
+
+
+def conformal_offset(scores:np.ndarray, level:float=RANGE_TAIL) -> float:
+    """Split conformal offset: the ceil((n + 1) * level)-th smallest score, floored at 0 (the range is only widened);
+    infinite (the range end goes to the end of the scale) when there are too few scores for that rank to exist."""
+    n = scores.size
+    j = -(-(n + 1) * round(level * 10) // 10)       # exact integer ceil((n + 1) * level) for level in tenths
+    if n == 0 or j > n:
+        return math.inf
+    return max(float(np.partition(scores, j - 1)[j - 1]), 0.0)
 
 
 class Forecaster(Protocol):
@@ -279,19 +374,33 @@ def plan_forecast(replay:dict, settings:ForecastSettings=ForecastSettings()) -> 
 
 
 def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
-                     on_progress:Callable[[int, int, float, int], None]=None) -> ForecastResult:
-    """Runs the model at every origin of the plan (all its buses in one batch) and scores the stored points against
-    what was observed. on_progress(origins done, origins, origin t, buses) is called after each origin."""
+                     on_progress:Callable[[int, int, float, int], None]=None,
+                     calibration:CalibrationSettings=CalibrationSettings()) -> ForecastResult:
+    """Runs the model at every origin of the plan (all its buses in one batch), calibrates its output walk-forward
+    (Calibrator) and scores the stored points, and the raw model output, against what was observed.
+    on_progress(origins done, origins, origin t, buses) is called after each origin."""
     grid, length = plan.grid, plan.prediction_length
     top_rank = max(len(grid.statuses) - 1, 0)
     kept = np.arange(1, plan.points + 1) * plan.point_slots - 1          # model steps at origin + point_every * (k + 1)
     median, low, high = QUANTILES.index(0.5), 0, len(QUANTILES) - 1
+    calibrator = Calibrator(plan.points, top_rank, calibration)
     stored: dict[str, list] = {}
-    scores = {name: [] for name in ("observed", "median", "low", "high", "last", "at_horizon")}
-    skipped = 0
+    columns = ("observed", "median", "low", "high", "last", "at_horizon")
+    scores, raw_scores = {name: [] for name in columns}, {name: [] for name in columns}
+    history_t, history_w = [], []
+    first_t: list[float | None] = [None] * plan.points
+    calibrated_points = skipped = 0
 
     for number, (slot, vehicles) in enumerate(plan.origins, start=1):
         t = float(grid.times[slot])
+        calibrator.fit(slot)        # on the forecasts whose outcome is known at this slot
+        history_t.append(t)
+        history_w.append([None if params is None else round(params["w"], 3) for params in calibrator.params])
+        for h, params in enumerate(calibrator.params):
+            if params is not None and first_t[h] is None:
+                first_t[h] = t
+        targets = slot + plan.point_slots * np.arange(1, plan.points + 1)     # grid slot of each point
+        inside = targets < grid.slots
         for start in range(0, len(vehicles), MAX_BATCH):
             batch_vehicles = vehicles[start:start + MAX_BATCH]
             contexts = [plan.context(vehicle, slot) for vehicle in batch_vehicles]
@@ -314,33 +423,40 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
             finite = np.isfinite(values).all(axis=(1, 2))      # before clipping, which would turn an infinity into a rank
             values = np.round(np.sort(np.clip(values, 0, top_rank), axis=1), 2)
 
-            for vehicle, quantiles, is_finite in zip(batch_vehicles, values, finite):
+            for vehicle, raw, is_finite in zip(batch_vehicles, values, finite):
                 if not is_finite:
                     skipped += 1
                     continue
+                rank = float(grid.levels[vehicle][slot])
+                quantiles, calibrated = calibrator.apply(rank, raw)
+                calibrated_points += int(calibrated.sum())
                 stored.setdefault(vehicle, []).append({"t": t, "q": quantiles.tolist()})
-                targets = slot + plan.point_slots * np.arange(1, plan.points + 1)     # grid slot of each point
-                inside = targets < grid.slots
                 observed = np.full(plan.points, np.nan)
                 observed[inside] = grid.levels[vehicle][targets[inside]]
+                calibrator.add(vehicle, targets, rank, raw, observed)
                 known = np.isfinite(observed)
-                scores["observed"].append(observed[known])
-                scores["median"].append(quantiles[median][known])
-                scores["low"].append(quantiles[low][known])
-                scores["high"].append(quantiles[high][known])
-                scores["last"].append(np.full(int(known.sum()), float(grid.levels[vehicle][slot])))
-                scores["at_horizon"].append((np.arange(plan.points) == plan.points - 1)[known])
+                for into, rows in ((scores, quantiles), (raw_scores, raw)):
+                    into["observed"].append(observed[known])
+                    into["median"].append(rows[median][known])
+                    into["low"].append(rows[low][known])
+                    into["high"].append(rows[high][known])
+                    into["last"].append(np.full(int(known.sum()), rank))
+                    into["at_horizon"].append((np.arange(plan.points) == plan.points - 1)[known])
         if on_progress:
             on_progress(number, len(plan.origins), t, len(vehicles))
     if skipped:
         logger.warning(f"Dropped {skipped} forecast(s) with NaN or infinite values.")
 
+    def scored(parts:dict) -> dict:
+        return score(**{name: np.concatenate(values) if values else np.empty(0) for name, values in parts.items()})
+
     settings = plan.settings
+    forecasts = sum(len(entries) for entries in stored.values())
     forecast = {
         "format": FORMAT,
         "version": VERSION,
         "model": forecaster.model,
-        "model_name": forecaster.model_name,
+        "model_name": f"{forecaster.model_name} + calibration" if calibrated_points else forecaster.model_name,
         "created_at": utc_now_iso(),
         "target": TARGET,
         "levels": list(grid.statuses),      # forecast value r (a rank) stands for status levels[r]
@@ -350,12 +466,45 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
         "origin_every": settings.origin_every,
         "min_history": settings.min_history,
         "quantiles": list(QUANTILES),
-        "metrics": score(**{name: np.concatenate(parts) if parts else np.empty(0) for name, parts in scores.items()}),
-        "vehicles": {vehicle: stored[vehicle] for vehicle in sorted(stored)},
+        "metrics": scored(scores),
     }
-    forecasts = sum(len(entries) for entries in stored.values())
+    if calibrated_points:
+        forecast["metrics_raw"] = scored(raw_scores)
+        forecast["calibration"] = calibration_info(calibrator, calibration, calibrated_points / (forecasts * plan.points),
+                                                   first_t, history_t, history_w)
+    forecast["vehicles"] = {vehicle: stored[vehicle] for vehicle in sorted(stored)}
     origins = len({entry["t"] for entries in stored.values() for entry in entries})
     return ForecastResult(forecast, len(stored), origins, forecasts, forecasts * plan.points, skipped)
+
+
+def calibration_info(calibrator:Calibrator, settings:CalibrationSettings, calibrated_share:float, first_t:list,
+                     history_t:list, history_w:list) -> dict:
+    """The replay's "calibration" key: how it was done, and what it learned (for the viewer and for students)."""
+    def offset(value:float) -> float | None:
+        return round(value, 2) if math.isfinite(value) else None
+
+    final = []
+    for params in calibrator.params:
+        if params is None:
+            final.append(None)
+            continue
+        final.append({"examples": params["examples"], "buses": params["buses"], "w": round(params["w"], 3),
+                      "low_offset": [offset(low) for low, _ in params["offsets"]],
+                      "high_offset": [offset(high) for _, high in params["offsets"]]})
+    return {
+        "method": "Walk-forward: before each forecast time, each forecast point (horizon) learns from the past "
+                  "forecasts whose outcome is known. The median is the current rank plus w times the model's predicted "
+                  "move (w in [0, 1], least squares); the 80% range is widened by split conformal offsets so that each "
+                  "end held 90% of past outcomes (per rank at the forecast time when it has enough examples).",
+        "min_points": settings.min_points,
+        "min_buses": settings.min_buses,
+        "cell_min_points": settings.cell_min_points,
+        "cell_min_buses": settings.cell_min_buses,
+        "calibrated_share": round(calibrated_share, 3),
+        "first_t": first_t,             # per point: replay t of its first calibrated forecast, null if never
+        "history": {"t": history_t, "w": history_w},
+        "final": final,                 # per point: what it had learned at the last forecast time
+    }
 
 
 def score(observed:np.ndarray, median:np.ndarray, low:np.ndarray, high:np.ndarray, last:np.ndarray,

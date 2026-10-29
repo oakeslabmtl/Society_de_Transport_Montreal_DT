@@ -135,8 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Precompute occupancy forecasts with Timestral (a time-series model by Mistral AI) and store them in the\n"
                     "replay, for the chart shown when a bus is selected in the viewer (the demo exe runs no model).\n"
                     "Every --every-minutes of replay time, each bus with --min-history-minutes of occupancy history gets a\n"
-                    "forecast of the next --horizon-minutes, made only from what was observed until then. The file is\n"
-                    "rewritten in place; an existing forecast is replaced.\n"
+                    "forecast of the next --horizon-minutes, made only from what was observed until then. Each forecast\n"
+                    "point is then calibrated on the earlier forecasts whose outcome is known (walk-forward): how much to\n"
+                    "trust the model's predicted change, and how far to widen the 80% range so that each end held 90% of\n"
+                    "past outcomes (so that it holds at least 80%).\n"
+                    "The file is rewritten in place; an existing forecast is replaced.\n"
                     "Needs Timestral and PyTorch, best in their own environment (from the repo root, see the README):\n"
                     "  uv venv .venv-forecast --python 3.12\n"
                     "  uv pip install --python .venv-forecast -r software\\recording\\requirements-forecast.in",
@@ -153,6 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="replay time between two forecasts of a bus (default: %(default)g)")
     forecast.add_argument("--min-history-minutes", type=float, default=2,
                           help="occupancy history a bus needs before its first forecast (default: %(default)g)")
+    forecast.add_argument("--no-calibration", action="store_true",
+                          help="store the model's raw output (no walk-forward calibration)")
     forecast.add_argument("--offline", action="store_true", help="only use a model already in the Hugging Face cache")
     forecast.add_argument("--device", default="cpu", help='PyTorch device (default: %(default)s); "cuda" needs a CUDA build '
                                                           'of PyTorch (on Windows, the requirements install the CPU-only one)')
@@ -339,8 +344,8 @@ def forecast_exported_replay(out:Path) -> int:
 
 def run_forecast(args) -> int:
     # numpy and Timestral are only needed here: the other commands work without them
-    from recording.forecast import (LEVELS, MODEL_SIZES, ForecastSettings, compute_forecast, load_forecaster, model_name,
-                                    plan_forecast, read_replay, resolve_model, set_forecast)
+    from recording.forecast import (LEVELS, MODEL_SIZES, CalibrationSettings, ForecastSettings, compute_forecast,
+                                    load_forecaster, model_name, plan_forecast, read_replay, resolve_model, set_forecast)
     from recording.replay import write_replay
 
     if args.horizon_minutes <= 0 or args.every_minutes <= 0 or args.min_history_minutes < 0:
@@ -375,31 +380,40 @@ def run_forecast(args) -> int:
             print(f"  [{done:>{width}}/{total}] {format_clock(replay['start_time'] + t, tz)}  {buses:>4} buses  "
                   f"{time.monotonic() - started:5.1f} s", flush=True)
 
-    result = compute_forecast(plan, forecaster, on_progress=progress)
+    calibration = CalibrationSettings(enabled=not args.no_calibration)
+    result = compute_forecast(plan, forecaster, on_progress=progress, calibration=calibration)
     elapsed = time.monotonic() - started
     previous = set_forecast(replay, result.forecast)
     size = write_replay(replay, path)
 
-    metrics = result.metrics
+    metrics, raw = result.metrics, result.metrics_raw
     replaced = f" - replaced the existing forecast (model {previous.get('model_name', '?')})" if isinstance(previous, dict) else ""
     print(f"\nSaved the forecast in {display_path(path)} ({size / 1e6:.1f} MB){replaced}")
     print(f"  model:    {forecaster.model_name} ({forecaster.model}), {elapsed:.0f} s for {result.origins} forecast times")
     print(f"  stored:   {result.vehicles} buses, {result.forecasts:,} forecasts, {result.points:,} points")
-    print(f"  right:    model {_percent_text(metrics['accuracy'])} of the time, "
-          f"\"no change\" baseline {_percent_text(metrics['accuracy_last_value'])}")
-    print(f"            at +{_minutes_text(settings.horizon)}: model {_percent_text(metrics['accuracy_at_horizon'])}, "
-          f"baseline {_percent_text(metrics['accuracy_last_value_at_horizon'])}")
-    print(f"  error:    model {_level_text(metrics['mae'])} steps on average, "
-          f"baseline {_level_text(metrics['mae_last_value'])}")
-    print(f"            at +{_minutes_text(settings.horizon)}: model {_level_text(metrics['mae_at_horizon'])}, "
-          f"baseline {_level_text(metrics['mae_last_value_at_horizon'])}")
-    print(f"  coverage: {_percent_text(metrics['coverage'])} of the observed statuses are inside the 80% range "
-          f"(a zero-width range at the last status: {_percent_text(metrics['accuracy_last_value'])})")
+    if raw:
+        print(f"  calibrated: {_percent_text(result.forecast['calibration']['calibrated_share'])} of the stored points "
+              f"(a forecast point is calibrated once it has {calibration.min_points} past outcomes from "
+              f"{calibration.min_buses} buses)")
+    elif calibration.enabled:
+        print(f"  calibrated: none (no forecast point had {calibration.min_points} past outcomes from "
+              f"{calibration.min_buses} buses): the raw model output is stored")
+    # Scores of the stored forecast, of the raw model output when it was calibrated, and of "no change"
+    ahead = f"  at +{_minutes_text(settings.horizon)}"
+    columns = [("calibrated", metrics), (f"raw {forecaster.model_name}", raw)] if raw else [(forecaster.model_name, metrics)]
+    print(f"\n  {'':<18}" + "".join(f"{name:>22}" for name, _ in columns) + f"{chr(34) + 'no change' + chr(34):>14}")
+    for label, key, baseline, text in (("right", "accuracy", "accuracy_last_value", _accuracy_text),
+                                       (ahead, "accuracy_at_horizon", "accuracy_last_value_at_horizon", _accuracy_text),
+                                       ("error (steps)", "mae", "mae_last_value", _level_text),
+                                       (ahead, "mae_at_horizon", "mae_last_value_at_horizon", _level_text),
+                                       ("80% range holds", "coverage", "accuracy_last_value", _percent_text)):
+        print(f"  {label:<18}" + "".join(f"{text(values[key]):>22}" for _, values in columns)
+              + f"{text(metrics[baseline]):>14}")
     status_names = {value: name for name, value in LEVELS.items()}
     scale = ", ".join(status_names.get(status, str(status)) for status in result.forecast["levels"])
-    print(f"            (on {metrics['evaluated_points']:,} points with an observed status. The scale is the statuses found, "
-          f"one step apart:\n            {scale}. \"Right\": the median rounded to a status is the observed one.\n"
-          f"            The baseline repeats the last observed status: occupancy changes rarely, so it is hard to beat.)")
+    print(f"\n  On {metrics['evaluated_points']:,} points with an observed status. The scale is the statuses found, one step "
+          f"apart:\n  {scale}.\n  \"Right\": the median rounded to a status is the observed one. \"No change\" repeats the "
+          f"last observed status\n  (its 80% range would have zero width): occupancy changes rarely, so it is hard to beat.")
     if result.skipped:
         print(f"warning: {result.skipped} forecast(s) with NaN or infinite values were dropped.")
     if path.resolve().parent == REPLAYS_DIR.resolve():
@@ -495,9 +509,17 @@ def _level_text(value:float | None) -> str:
     return "n/a" if value is None else f"{value:.2f}"
 
 
-def _percent_text(value:float | None) -> str:
+def _percent_text(value:float | None, decimals:int=0) -> str:
     """0.725 -> '73%': half up, as the viewer rounds (Python's format rounds half to even: '72%')."""
-    return "n/a" if value is None else f"{math.floor(100 * value + 0.5)}%"
+    if value is None:
+        return "n/a"
+    scale = 10 ** decimals
+    return f"{math.floor(100 * scale * value + 0.5) / scale:.{decimals}f}%"
+
+
+def _accuracy_text(value:float | None) -> str:
+    """With one decimal: 74.0% and 74.3% must not both read 74%."""
+    return _percent_text(value, 1)
 
 
 def _clock_text(seconds:float) -> str:

@@ -71,6 +71,7 @@ var _history_points := 0
 var _forecast_points := 0
 var _message := ""
 var _future_note := "" # Shown in the empty plot area after now when there is nothing to draw there
+var _calibration_note := "" # Shown at the top right of the plot while the shown forecast is partly uncalibrated
 var _label_column := 0.0
 var _hidden := {} # route -> true: lines whose buses and stops are hidden
 
@@ -252,7 +253,8 @@ func chart_stats() -> Dictionary:
 		rows.append(Occupancy.label(status))
 	return {"visible": _chart.visible, "vehicle": vehicle_id, "history_points": _history_points if _chart.visible else 0,
 		"forecast_points": _forecast_points if _chart.visible else 0, "message": _message if _chart.visible else "",
-		"rows": rows, "legend": legend_labels()}
+		"rows": rows, "legend": legend_labels(), "calibration_note": _calibration_note if _chart.visible else "",
+		"footer_tooltip": _footer.tooltip_text if _chart.visible else ""}
 
 ## Labels of the legend's occupancy entries, in order (self-test)
 func legend_labels() -> PackedStringArray:
@@ -768,6 +770,8 @@ func _rebuild() -> void:
 	_future_note = ""
 	if _fc_times.is_empty() and _actual_times.is_empty():
 		_future_note = "No forecast yet" if _is_replay and data.has_forecast and _too_little_history() else "No forecast"
+	# Early in a calibrated replay, some points are still the raw model output
+	_calibration_note = "calibration still learning" if _forecast != null and data.calibration_learning(_forecast["origin"]) else ""
 
 	_update_texts()
 	_update_hover()
@@ -803,32 +807,98 @@ func _footer_text() -> String:
 		if _is_number(accuracy) and _is_number(baseline):
 			# Computed from the metrics, never assumed: the model may well not beat "no change"
 			var verdict := "better than" if float(accuracy) > float(baseline) + 0.005 else "no better than"
-			text += " · right %d%% of the time, %s “no change” (%d%%)" % [roundi(accuracy * 100.0), verdict, roundi(baseline * 100.0)]
+			var decimals := _decimals_apart(accuracy, baseline)
+			text += " · right %s, %s “no change” (%s)" % [_percent(accuracy, decimals), verdict, _percent(baseline, decimals)]
 		elif _is_number(accuracy):
-			text += " · right %d%% of the time" % roundi(accuracy * 100.0)
+			text += " · right %s of the time" % _percent(accuracy)
 		return text
 	if _too_little_history():
 		return "No forecast for this bus yet (needs %s of history)" % _duration_text(data.min_history)
 	return "No forecast for this bus at this time"
 
-## Footer tooltip: what the scores mean, and the error in steps
+## Footer tooltip: what the scores mean, the error in steps and, for a calibrated forecast, what the calibration did
+## (numbers from this replay's forecast)
 func _metrics_text() -> String:
 	var lines := PackedStringArray()
-	lines.append("Forecast precomputed with %s; scores over the whole replay." % data.model_name)
-	lines.append("“Right”: the median rounded to a status is the observed status.")
-	lines.append("“No change” always predicts the last observed status.")
+	var calibrated: bool = not data.metrics_raw.is_empty()
+	# Without the raw scores, the scores shown are those of model_name as stored (calibrated or not)
+	var model: String = data.model_name.trim_suffix(" + calibration") if calibrated else data.model_name
+	lines.append("Forecast precomputed with %s%s; scores over the whole replay." % [model, ", then calibrated" if calibrated else ""])
+	lines.append("“Right”: the median rounded to a status is the observed status. “No change” repeats the last observed status.")
+	if calibrated:
+		var raw_accuracy = data.metrics_raw.get("accuracy")
+		var raw_coverage = data.metrics_raw.get("coverage")
+		var accuracy = data.metrics.get("accuracy")
+		var coverage = data.metrics.get("coverage")
+		if _is_number(raw_accuracy) and _is_number(raw_coverage) and _is_number(accuracy) and _is_number(coverage):
+			var decimals := _decimals_apart(raw_accuracy, accuracy)
+			lines.append("Raw %s: right %s, its %d%% range held %s. Calibrated: right %s, the range holds %s." % [model,
+				_percent(raw_accuracy, decimals), data.range_percent(), _percent(raw_coverage), _percent(accuracy, decimals), _percent(coverage)])
+	else:
+		var coverage = data.metrics.get("coverage")
+		if _is_number(coverage):
+			lines.append("The %d%% range holds %s of the observed statuses." % [data.range_percent(), _percent(coverage)])
 	var mae = data.metrics.get("mae")
 	var mae_baseline = data.metrics.get("mae_last_value")
 	if _is_number(mae) and _is_number(mae_baseline):
-		lines.append("Average error: %.2f steps between statuses (“no change”: %.2f)." % [mae, mae_baseline])
+		var digits := "%.3f" if "%.2f" % mae == "%.2f" % mae_baseline else "%.2f" # 0.295 vs 0.290, not 0.29 vs 0.29
+		lines.append(("Average error: " + digits + " steps between statuses (“no change”: " + digits + ").") % [mae, mae_baseline])
 	var at_horizon = data.metrics.get("accuracy_at_horizon")
 	var baseline_at_horizon = data.metrics.get("accuracy_last_value_at_horizon")
 	if _is_number(at_horizon) and _is_number(baseline_at_horizon):
-		lines.append("%s ahead: right %d%% of the time (“no change”: %d%%)." % [_duration_text(data.horizon), roundi(at_horizon * 100.0), roundi(baseline_at_horizon * 100.0)])
-	var coverage = data.metrics.get("coverage")
-	if _is_number(coverage):
-		lines.append("The %d%% range holds %d%% of the observed statuses." % [data.range_percent(), roundi(coverage * 100.0)])
+		var decimals := _decimals_apart(at_horizon, baseline_at_horizon)
+		lines.append("%s ahead: right %s (“no change”: %s)." % [_duration_text(data.horizon), _percent(at_horizon, decimals), _percent(baseline_at_horizon, decimals)])
+	lines.append_array(_calibration_lines())
 	return "\n".join(lines)
+
+## What the calibration learned, for students: it only looks back, how much it trusts the model's predicted changes
+func _calibration_lines() -> PackedStringArray:
+	var lines := PackedStringArray()
+	if data.calibration.is_empty():
+		return lines
+	var final: Array = data.calibration["final"]
+	var last = final[final.size() - 1]
+	if last is Dictionary:
+		lines.append("The calibration only looks back: before each forecast it learns from the earlier forecasts whose outcome is known (by the end, %s at %s ahead, from %d buses)." % [_thousands(int(last["examples"])), _duration_text(data.horizon), int(last["buses"])])
+	# Its trust in the model's predicted changes: the highest weight it reached, and where it ended at the horizon
+	var history: Dictionary = data.calibration["history"]
+	var best := -1.0
+	var best_point := 0
+	var best_time := 0.0
+	for row_index in history["w"].size():
+		var row: Array = history["w"][row_index]
+		for point in row.size():
+			if row[point] != null and float(row[point]) > best:
+				best = float(row[point])
+				best_point = point
+				best_time = float(history["t"][row_index])
+	if best >= 0.0 and last is Dictionary:
+		var final_weight := float(last["w"])
+		# Why the weight ended where it did: read from the weight, not assumed from the bundled hour
+		var reason := "most buses keep their status" if final_weight < 0.5 else "its predicted changes mostly happen"
+		lines.append("It trusts %s's predicted changes up to %s (%s ahead, %d min into the replay); by the end, %s at %s ahead: %s." % [
+			data.model_name.trim_suffix(" + calibration"), _percent(best), _duration_text(data.point_every * (best_point + 1)),
+			roundi(best_time / 60.0), _percent(final_weight), _duration_text(data.horizon), reason])
+	lines.append("Its range is widened until each end held 90% of past outcomes, so that it holds at least 8 outcomes in 10.")
+	return lines
+
+## "74%", or "74.0%" with decimals = 1 (x.5 rounds up, like the forecast tool)
+static func _percent(value, decimals := 0) -> String:
+	var scale := pow(10.0, decimals)
+	return ("%." + str(decimals) + "f%%") % (floorf(float(value) * 100.0 * scale + 0.5) / scale)
+
+## "4,382"
+static func _thousands(value: int) -> String:
+	var digits := str(absi(value))
+	var text := ""
+	while digits.length() > 3:
+		text = "," + digits.right(3) + text
+		digits = digits.left(digits.length() - 3)
+	return ("-" if value < 0 else "") + digits + text
+
+## 1 decimal when two shares round to the same whole percent (74.0% vs 74.3%, not 74% vs 74%), else 0
+static func _decimals_apart(a, b) -> int:
+	return 1 if _percent(a) == _percent(b) else 0
 
 static func _is_number(value) -> bool:
 	return value is float or value is int
@@ -838,9 +908,12 @@ func _too_little_history() -> bool:
 	var first_known: float = data.first_known_time(vehicle_id, _now)
 	return first_known < 0.0 or _now - first_known < data.min_history
 
+## "10 min", "2.5 min", "30 s"
 static func _duration_text(seconds: float) -> String:
 	if seconds >= 60.0 and is_equal_approx(fmod(seconds, 60.0), 0.0):
 		return "%d min" % roundi(seconds / 60.0)
+	if seconds >= 60.0 and is_equal_approx(fmod(seconds, 30.0), 0.0):
+		return "%.1f min" % (seconds / 60.0)
 	return "%d s" % roundi(seconds)
 
 ## Snaps the hovered x to the nearest observation or forecast point and fills the tooltip
@@ -1001,6 +1074,10 @@ func _draw_series() -> void:
 		if width > 40.0:
 			var baseline := _area.size.y * 0.5 + (font.get_ascent(AXIS_FONT_SIZE) - font.get_descent(AXIS_FONT_SIZE)) * 0.5
 			_area.draw_string(font, Vector2(x0, baseline), _future_note, HORIZONTAL_ALIGNMENT_CENTER, width, AXIS_FONT_SIZE, INK_SECONDARY)
+	if _calibration_note != "":
+		var font := _area.get_theme_font("font", "Label")
+		_area.draw_string(font, Vector2(0, font.get_ascent(AXIS_FONT_SIZE) + 2.0), _calibration_note, HORIZONTAL_ALIGNMENT_RIGHT,
+			_area.size.x - 4.0, AXIS_FONT_SIZE, INK_MUTED)
 
 	if _hover_time >= 0.0:
 		var x := roundf(_x_of(_hover_time)) + 0.5

@@ -863,6 +863,12 @@ func _finish_selftest() -> void:
 		elif _chart_stats.get("forecast_points", 0) == 0:
 			errors.append("The replay has a forecast but the chart of bus %s shows none (%s)" % [_chart_stats.get("vehicle", "-"), _chart_stats.get("message", "no bus selected")])
 			occupancy_ok = false
+		elif not occupancy_data.calibration.is_empty() and not String(_chart_stats.get("footer_tooltip", "")).contains("Calibrated:"):
+			errors.append("The forecast is calibrated but the chart's footer does not explain it: %s" % _chart_stats.get("footer_tooltip", ""))
+			occupancy_ok = false
+		elif _calibration_timing_error() != "":
+			errors.append(_calibration_timing_error())
+			occupancy_ok = false
 	# The chart itself, with or without a forecast (the replay is paused: now is when the stats were taken)
 	if loaded and not buses.is_empty():
 		if not _chart_stats.get("visible", false) or _chart_stats.get("vehicle", "") != _chart_bus_id:
@@ -922,6 +928,9 @@ func _finish_selftest() -> void:
 		"forecast_model": occupancy_data.model_name,
 		"forecast_vehicles": occupancy_data.vehicle_count,
 		"forecast_origins": occupancy_data.origin_count,
+		"forecast_calibrated": not occupancy_data.calibration.is_empty(),
+		"chart_calibration_note": _chart_stats.get("calibration_note", ""),
+		"chart_footer_tooltip": _chart_stats.get("footer_tooltip", ""),
 		"chart_visible": _chart_stats.get("visible", false),
 		"chart_vehicle": _chart_stats.get("vehicle", ""),
 		"chart_history_points": _chart_stats.get("history_points", 0),
@@ -948,6 +957,20 @@ func _finish_selftest() -> void:
 		exit_code = 2
 	OS.remove_logger(_selftest_logger)
 	get_tree().quit(exit_code)
+
+## Self-test: "" when a calibrated forecast is raw at its first forecast time (nothing learned yet) and, at its last,
+## still learning only if a point was never calibrated (a short replay); else what is wrong
+func _calibration_timing_error() -> String:
+	var calibration: Dictionary = occupancy_data.calibration
+	if calibration.is_empty() or calibration["history"]["t"].is_empty():
+		return ""
+	var times: Array = calibration["history"]["t"]
+	var at_first := occupancy_data.calibration_learning(replay_player.start_time + float(times[0]))
+	var at_last := occupancy_data.calibration_learning(replay_player.start_time + float(times[times.size() - 1]))
+	if at_first and at_last == calibration["first_t"].has(null):
+		return ""
+	return "The calibration's start times are wrong: still learning at the first forecast time %s, at the last %s (never calibrated points: %s)" % [
+		at_first, at_last, calibration["first_t"].has(null)]
 
 ## Saves the current view as a PNG; returns the path, or "" (reason in _shot_error).
 ## Headless runs render nothing, so there is no screenshot then.

@@ -22,6 +22,9 @@ var model_name := ""
 var quantiles := PackedFloat64Array()
 var forecast_levels := PackedInt32Array() # Status of each forecast rank: rank r stands for forecast_levels[r]
 var metrics := {} # Contract metrics; values are floats or null
+var metrics_raw := {} # Same keys, for the model's raw output when the stored forecast is calibrated ({} otherwise)
+var calibration := {} # The forecast's "calibration" key when valid ({} otherwise): what the calibration learned
+var _calibrated_from := PackedFloat64Array() # Per forecast point: unix time of its first calibrated forecast (INF: never)
 var horizon := 600.0
 var point_every := 30.0
 var origin_every := 60.0
@@ -231,6 +234,9 @@ func _reset_forecast() -> void:
 	quantiles = PackedFloat64Array()
 	forecast_levels = PackedInt32Array()
 	metrics = {}
+	metrics_raw = {}
+	calibration = {}
+	_calibrated_from = PackedFloat64Array()
 	vehicle_count = 0
 	origin_count = 0
 	_forecasts = {}
@@ -339,7 +345,52 @@ func _parse_forecast(raw, start_time: float) -> String:
 	metrics = raw_metrics if raw_metrics is Dictionary else {}
 	vehicle_count = _forecasts.size()
 	origin_count = origins_seen.size()
+	# Optional (calibrated forecasts): never a reason to drop the forecast itself
+	var raw_model_metrics = raw.get("metrics_raw")
+	metrics_raw = raw_model_metrics if raw_model_metrics is Dictionary else {}
+	if raw.has("calibration"):
+		var error := _parse_calibration(raw["calibration"], start_time, point_count)
+		if error != "":
+			calibration = {}
+			_calibrated_from = PackedFloat64Array()
+			push_warning("Occupancy: forecast calibration details ignored: " + error)
 	return ""
+
+## Reads the forecast's optional "calibration" key into calibration and _calibrated_from; returns an error or ""
+func _parse_calibration(raw, start_time: float, point_count: int) -> String:
+	if not raw is Dictionary:
+		return "not an object"
+	var first_t = raw.get("first_t")
+	if not first_t is Array or first_t.size() != point_count:
+		return "\"first_t\" must have one entry per forecast point"
+	for value in first_t:
+		if value != null and not _is_number(value):
+			return "\"first_t\" must hold numbers or null"
+		_calibrated_from.append(start_time + float(value) if value != null else INF)
+	var history = raw.get("history")
+	if not history is Dictionary or not history.get("t") is Array or not history.get("w") is Array \
+			or history["t"].size() != history["w"].size():
+		return "\"history\" must have as many weight rows as times"
+	for row in history["w"]:
+		if not row is Array or row.size() != point_count or row.any(func(w): return w != null and not _is_number(w)):
+			return "each \"history.w\" row must hold one number or null per forecast point"
+	var final = raw.get("final")
+	if not final is Array or final.size() != point_count:
+		return "\"final\" must have one entry per forecast point"
+	for entry in final:
+		if entry != null and (not entry is Dictionary or not _is_number(entry.get("w")) or not _is_number(entry.get("examples")) \
+				or not _is_number(entry.get("buses"))):
+			return "each \"final\" entry must be null or have numbers w, examples and buses"
+	calibration = raw
+	return ""
+
+## True when some points of the calibrated forecast made at origin_unix are still the raw model output: their
+## calibration had too few past outcomes yet (false for a forecast that was not calibrated at all)
+func calibration_learning(origin_unix: float) -> bool:
+	for first in _calibrated_from:
+		if origin_unix + TIME_EPSILON < first:
+			return true
+	return false
 
 static func _is_number(value) -> bool:
 	return value is float or value is int

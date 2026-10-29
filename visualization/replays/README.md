@@ -74,8 +74,8 @@ Readers ignore unknown top-level keys, so new data (like `forecast` below) can b
   "format": "stm-dt-occupancy-forecast",
   "version": 2,
   "model": "mistralai/Timestral-28M",
-  "model_name": "Timestral-28M",
-  "created_at": "2026-10-29T16:12:30Z",
+  "model_name": "Timestral-28M + calibration",
+  "created_at": "2026-10-30T16:29:19Z",
   "target": "vehicle.occupancy_status",
   "levels": [1, 2, 3, 5],
   "step": 15.0,
@@ -84,9 +84,17 @@ Readers ignore unknown top-level keys, so new data (like `forecast` below) can b
   "origin_every": 60.0,
   "min_history": 120.0,
   "quantiles": [0.1, 0.5, 0.9],
-  "metrics": {"evaluated_points": 98071, "mae": 0.313, "mae_last_value": 0.29, "mae_at_horizon": 0.546,
-              "mae_last_value_at_horizon": 0.51, "accuracy": 0.73, "accuracy_last_value": 0.743,
-              "accuracy_at_horizon": 0.55, "accuracy_last_value_at_horizon": 0.567, "coverage": 0.814},
+  "metrics": {"evaluated_points": 98071, "mae": 0.295, "mae_last_value": 0.29, "mae_at_horizon": 0.52,
+              "mae_last_value_at_horizon": 0.51, "accuracy": 0.74, "accuracy_last_value": 0.743,
+              "accuracy_at_horizon": 0.563, "accuracy_last_value_at_horizon": 0.567, "coverage": 0.893},
+  "metrics_raw": {"evaluated_points": 98071, "mae": 0.313, "mae_last_value": 0.29, "mae_at_horizon": 0.546,
+                  "mae_last_value_at_horizon": 0.51, "accuracy": 0.73, "accuracy_last_value": 0.743,
+                  "accuracy_at_horizon": 0.55, "accuracy_last_value_at_horizon": 0.567, "coverage": 0.814},
+  "calibration": {"method": "Walk-forward: ...", "min_points": 200, "min_buses": 20, "cell_min_points": 100,
+                  "cell_min_buses": 10, "calibrated_share": 0.869, "first_t": [299.991, 299.991, 359.998, ...],
+                  "history": {"t": [119.99, ...], "w": [[null, ...], ...]},
+                  "final": [{"examples": 5453, "buses": 114, "w": 0.081, "low_offset": [0.0, 0.0, 0.0, 0.0],
+                             "high_offset": [0.0, 0.0, 0.0, 0.0]}, ...]},
   "vehicles": {
     "40902": [
       {"t": 119.99, "q": [[0.4, 0.3, 0.1], [1.0, 1.0, 1.0], [1.6, 1.7, 1.9]]}
@@ -106,6 +114,8 @@ Readers ignore unknown top-level keys, so new data (like `forecast` below) can b
 | `origin_every`, `min_history` | A forecast is made every `origin_every` seconds of replay time, for each bus with `min_history` seconds of history since its first known status and a known status at that time. |
 | `quantiles` | Levels of the rows of `q`: 10%, median and 90%, so `q[0]`..`q[2]` is the 80% range. |
 | `metrics` | How good the stored forecasts were on this replay, compared with what was observed (`null` when nothing could be compared): `evaluated_points` (points with an observed status at their time), `mae` (mean absolute error of the median, in ranks: steps between statuses), `mae_last_value` (same for the "last observed status" baseline), `accuracy` (share of points where the median rounded to the nearest rank, .5 up, is the observed status) and `accuracy_last_value` (same for the baseline), the same four for the last point only (`*_at_horizon`), and `coverage` (share of observed statuses inside the 80% range). |
+| `metrics_raw` | Optional, present when the stored forecast is calibrated: the same scores for the raw model output. `model_name` then ends with " + calibration". |
+| `calibration` | Optional, present when the stored forecast is calibrated (walk-forward: each forecast point learns, before each forecast time, from the earlier forecasts whose outcome is known). `method` (a sentence), the thresholds `min_points`, `min_buses` (a point is calibrated once it has that many past outcomes from that many buses), `cell_min_points`, `cell_min_buses` (for range offsets per status at the forecast time), `calibrated_share` (share of the stored points that are calibrated), `first_t` (per point: the `t` of its first calibrated forecast, or `null`), `history` (`t`: the forecast times; `w`: per time, the trust weight of each point, or `null` while it is raw) and `final` (per point, at the last forecast time: `examples`, `buses`, `w`, and `low_offset` / `high_offset` per rank, or `null`). The calibrated median is `L + w * (model median - L)`, L the rank at the forecast time; the range ends are moved out by the offsets. The viewer ignores this key if it is malformed. |
 | `vehicles` | Bus id (string, the same as `vehicle.vehicle.id`) -> its forecasts, sorted by `t`. |
 | `vehicles[].t` | When the forecast was made: a frame time, on the same timeline as `frames[].t` (unix time = `start_time + t`). It uses only what was observed until then. |
 | `vehicles[].q` | `q[j][k]` = quantile `quantiles[j]` of the rank at `t + point_every * (k + 1)`: rounded to 2 decimals, between 0 and `len(levels) - 1`, and `q[0][k] <= q[1][k] <= q[2][k]`. |

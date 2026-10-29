@@ -161,6 +161,11 @@ Copy an exported `.json` into the `replays` folder next to `STM DT Demo.exe` in 
 - The spec has nine statuses. Six of them, from `EMPTY` (0) to `FULL` (5), say how full the bus is: the viewer charts and forecasts those. `NOT_ACCEPTING_PASSENGERS` (6) and `NOT_BOARDABLE` (8) are shown on the bus in purple but not charted or forecast; `NO_DATA_AVAILABLE` (7) and a missing status are "no data". The spec also says a feed may publish only some statuses and that consumers must not assume they follow a linear scale. STM sends only four: many seats available, few seats available, standing room only and full (values 1, 2, 3 and 5). It never sends empty (0) or crushed standing room only (4). The legend at the top left and the chart therefore list only the statuses found in the data. The legend's two checkboxes show or hide the teal bus-stop poles and the blue reference points, which are not buses. The reference points (the poles of known coordinates that place the buses on the 3D map) are hidden at start.
 - Click a bus to open its chart: one row per status, its occupancy over the last 20 minutes and, when the replay has a forecast, the next 10 minutes (dashed median and its 80% range). In a replay, **Show actual** draws what really happened next. Close the chart with **×**. The selected bus has a blue outline, the color of its chart. Clicking another bus selects it instead. In a replay, a bus the feed skips for up to 3 polls in a row (45 s) stays where it was, so it stays selected; after that, or at once after a jump on the timeline, it is removed until it reports again.
 - The forecasts are made with [Timestral](https://github.com/mistralai/timestral), a time-series model by Mistral AI, and stored in the replay file in advance: the demo exe runs no model and needs no Python. Every minute of replay time, each bus with at least 2 minutes of occupancy history gets a forecast of the next 10 minutes (a point every 30 s), made only from what was observed until then. The model works on the ranks of the statuses found, not on their values: for STM, many seats available is step 0 and full is step 3. That scale is the statuses found in the whole replay.
+- Each forecast is then **calibrated walk-forward**: before each forecast time, every forecast point (+30 s to +10 min) learns from the earlier forecasts whose outcome is already known, never from the future. Two things are learned, both easy to explain:
+  - **A trust weight w** (0 to 1): the forecast median is the current status plus w times Timestral's predicted change. w is the least-squares fit of the changes that really happened on the changes Timestral predicted.
+  - **An honest 80% range** (split conformal prediction): the range is widened until, in the past, each of its ends held 90% of the outcomes, so that it holds at least 8 outcomes in 10 (89% on the bundled hour).
+
+  A point needs 200 past outcomes from 20 buses first, so the first 5 to 14 minutes of a replay show raw Timestral (the chart says "calibration still learning"). `forecast --no-calibration` stores the raw model output.
 - To add (or redo) the forecast of a replay, use a separate environment, so the main one stays small (Timestral needs PyTorch). From the repository root:
   ```
   uv venv .venv-forecast --python 3.12
@@ -168,18 +173,41 @@ Copy an exported `.json` into the `replays` folder next to `STM DT Demo.exe` in 
   .venv-forecast\Scripts\python software\recording forecast visualization\replays\<file>.json
   ```
   Without uv: `python -m venv .venv-forecast`, then `.venv-forecast\Scripts\python -m pip install -r software\recording\requirements-forecast.in`. The first run downloads the model to the Hugging Face cache (Timestral-28M, 111 MB; `--model 5M`, `123M` or `209M` for the other sizes, 21 MB to 837 MB; add `--offline` once it is cached). For the bundled hour it takes from about 20 seconds to 1.5 minutes on a laptop CPU and adds about 1.6 MB to the file, which is rewritten in place. Then rebuild the zip, or copy the file into the `replays` folder of an unzipped demo. `export --forecast` exports and forecasts in one go. Timestral's code is under Apache-2.0 and its weights under a Modified MIT license.
-- What the numbers mean: `forecast` prints three scores (the first two also 10 minutes ahead):
+- What the numbers mean: `forecast` prints three scores (the first two also 10 minutes ahead), for the stored (calibrated) forecast, the raw model output and a "no change" baseline that repeats the last observed status:
   - how often the median, rounded to a status, is the observed status ("right");
   - its average error, in steps between statuses;
   - the coverage: the share of observed statuses inside the 80% range.
 
-  The first two come with a "no change" baseline that repeats the last observed status. Occupancy changes only a few times per bus per hour, so that baseline is hard to beat. The coverage is generous: statuses are whole steps and many ranges have zero width at the current status, so a zero-width range at the last observed status would already score 74% on the bundled hour (`forecast` prints that figure next to it).
+  Occupancy changes only a few times per bus per hour, so "no change" is hard to beat. A zero-width range at the last observed status would already hold 74% of the outcomes on the bundled hour.
 - Results on the bundled hour:
-  - Timestral-28M is right 73% of the time, against 74% for "no change". Ten minutes ahead, it is right 55% of the time, against 57%.
-  - Its average error is 0.31 steps, against 0.29 for the baseline.
-  - Its 80% range holds 81% of the observed statuses. Computed separately from the stored forecast: 72% ten minutes ahead, and only 29% when the status had changed since the forecast was made.
 
-  Its median is no better than "no change". The chart's footer shows the model, how often it is right and whether it beats "no change"; hover the footer for the other scores.
+  | | calibrated (stored) | raw Timestral-28M | "no change" |
+  |---|---|---|---|
+  | right | 74.0% | 73.0% | 74.3% |
+  | right, 10 min ahead | 56.3% | 55.0% | 56.7% |
+  | average error (steps) | 0.295 | 0.313 | 0.290 |
+  | 80% range holds | 89% | 81% | – |
+
+  - The calibration makes Timestral more accurate (+1.1 points, 95% interval [+0.7, +1.4]) but not better than "no change" (−0.25 points [−0.36, −0.14]). From about minute 14 (once every point is calibrated), the dashed median stays at the current status: the calibration learned that "it stays the same" is the best guess on this hour. Its trust in Timestral's predicted changes peaks at 56% (2.5 minutes ahead, minute 7) and ends at 12% 10 minutes ahead.
+  - The range is honest now: it holds 89% of the outcomes (86% 10 minutes ahead, against 72% raw), and 59% of the outcomes where the status changed (29% raw). The price is a range about 1.7 times wider.
+
+  The chart's footer shows the model, how often it is right and whether it beats "no change"; hover the footer for the other scores and what the calibration learned.
+
+### What we tried to make the forecast better (for students)
+
+The question: could correlations between buses, or where a bus is, predict its occupancy better? Everything was tested on the bundled hour, walk-forward (each forecast only learns from the past), with a decision rule fixed before looking at the results: a method wins only if it is right more often than "no change", with a 95% interval above 0 (2,000 resamplings of whole buses).
+
+- **The data does hold real patterns.**
+  - The bus ahead: when the previous bus of the same line got fuller after passing this bus's stop, this bus got fuller 10 minutes later in 46% of cases, and emptier in only 7% (correlation +0.33).
+  - Trip ends: the status changes twice as often when a bus starts a new trip (47% vs 24%), and a new trip usually starts with many seats available (71%).
+  - Metro stations on the way: more changes (+12 points), but not in one direction.
+- **But correlation is not forecasting.** Used as predictors, they did not win:
+  - Adding the bus ahead's change to the calibrated forecast: 10 minutes ahead, −1.7 points against "no change", worse than the calibrated forecast alone (−0.3).
+  - A location-aware logistic regression (current status, trip progress, stations ahead, bus ahead, Timestral's output): right 73.4%, −0.9 points against "no change". It did predict better probabilities and a better range, but what it learned about trip position did not match the data.
+  - Giving Timestral a longer history, or the other buses' occupancy as extra inputs, did not help either (previous study).
+- **What did help is calibration** (above): it fixes Timestral's own weaknesses, overconfident changes and a too-narrow range, using only its past results.
+- **Limits.** One rush hour of one Wednesday, 6 lines. The intervals are optimistic: they resample buses without refitting the walk-forward models. Some buses report "many seats available" for a whole hour (probably a stuck sensor), which flatters "no change". Trip ends could only be guessed: the 2025 timetable in `datasets\` matches none of the 2026 trips.
+- **Next steps** need more data: record several weekday hours (morning and evening peaks) with `record`, then train on some days and test on others, and use a current STM timetable for trip ends.
 
 ### Lines and their stops
 
@@ -196,7 +224,7 @@ Copy an exported `.json` into the `replays` folder next to `STM DT Demo.exe` in 
 
 ### Notes
 
-- The bundled replay is `visualization/replays/2026-10-28_wednesday_downtown_routes-24-51-55-80-129-165_1610-1710.json` (14.4 MB), titled "Wednesday 28 October 2026 · downtown rush hour, routes 24, 51, 55, 80, 129, 165". It covers Wednesday 28 October 2026, 16:10 to 17:10 local time: 241 frames, 118 buses, about 95 of them in service at any moment and about 55 on the 3D map. It includes each bus's occupancy (in this rush hour about 35% many seats available, 28% few seats, 31% standing room only and 5% full), and its Timestral-28M occupancy forecast.
+- The bundled replay is `visualization/replays/2026-10-28_wednesday_downtown_routes-24-51-55-80-129-165_1610-1710.json` (14.4 MB), titled "Wednesday 28 October 2026 · downtown rush hour, routes 24, 51, 55, 80, 129, 165". It covers Wednesday 28 October 2026, 16:10 to 17:10 local time: 241 frames, 118 buses, about 95 of them in service at any moment and about 55 on the 3D map. It includes each bus's occupancy (in this rush hour about 35% many seats available, 28% few seats, 31% standing room only and 5% full), and its Timestral-28M occupancy forecast, calibrated walk-forward.
   - It was recorded live with `python software\recording record --routes "24,51,55,80,129,165" --minutes 63 --name 2026-10-28_wednesday_downtown_routes-24-51-55-80-129-165`, then exported with `python software\recording export recordings\2026-10-28_wednesday_downtown_routes-24-51-55-80-129-165.sqlite --minutes 60 --name "Wednesday 28 October 2026 · downtown rush hour, routes 24, 51, 55, 80, 129, 165"`, and its forecast was added with `.venv-forecast\Scripts\python software\recording forecast` on that file (default settings). `export` does not replace an existing file unless you add `--force`.
   - Its source, `recordings\2026-10-28_wednesday_downtown_routes-24-51-55-80-129-165.sqlite`, is a live capture. It is not in git and cannot be recreated, so back it up.
 - Optional extra replay: Saturday 1 March 2025, routes 45, 121 and 140, from `datasets\20250301-buses.csv`. It is not bundled because none of its buses are ever on the 3D map (right-click for free-fly to reach them). To try it, export it straight into the `replays` folder of an unzipped demo (dropped files come first, so it then plays at startup):

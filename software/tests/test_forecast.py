@@ -1,4 +1,5 @@
 import contextlib
+import functools
 import importlib.abc
 import io
 import json
@@ -8,13 +9,15 @@ import subprocess
 import sys
 import types
 import unittest
+from fractions import Fraction
 from unittest import mock
 import numpy as np
 from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, make_recording
 from recording import RecordingError, forecast
 from recording.cli import build_parser, main
-from recording.forecast import (QUANTILES, ForecastSettings, build_grid, compute_forecast, load_forecaster, model_name,
-                                occupancy_level, plan_forecast, resolve_model, score, set_forecast)
+from recording.forecast import (QUANTILES, CalibrationSettings, ForecastSettings, build_grid, compute_forecast,
+                                conformal_offset, load_forecaster, model_name, occupancy_level, plan_forecast,
+                                resolve_model, score, set_forecast)
 from recording.replay import write_replay
 
 MISSING = object()      # make_replay: the entity has no vehicle.occupancy_status key
@@ -344,6 +347,151 @@ class ComputeTest(unittest.TestCase):
             compute_forecast(plan, FakeForecaster(fn=degenerate))
 
 
+class CalibrationTest(unittest.TestCase):
+    """Walk-forward calibration (Calibrator), with thresholds low enough for a few test buses."""
+    SETTINGS = CalibrationSettings(min_points=6, min_buses=2, cell_min_points=1000)     # one range offset per horizon
+
+    def setUp(self):
+        # 4 buses moving through statuses 1, 2, 3 and 5 (ranks 0-3); a forecast every 2 slots, 4 points 2 slots apart
+        pattern = [1, 1, 2, 2, 3, 3, 2, 1, 2, 3, 5, 3]
+        self.series = {f"b{i}": (pattern[i:] + pattern[:i]) * 3 for i in range(4)}
+        self.plan = plan_forecast(series_replay(self.series), ForecastSettings(horizon=120, origin_every=30,
+                                                                               min_history=30))
+
+    @staticmethod
+    def predicts_a_rise(context, length, quantiles):
+        last = np.array([row[np.isfinite(row)][-1] for row in context], dtype=np.float32)
+        median = last[:, None] + 0.8 * np.arange(1, length + 1, dtype=np.float32)[None, :] / length
+        return np.stack([median - 0.5, median, median + 0.5], axis=1).astype(np.float32)
+
+    def run_forecast(self, plan, settings:CalibrationSettings) -> dict:
+        return compute_forecast(plan, FakeForecaster(fn=self.predicts_a_rise), calibration=settings).forecast
+
+    def check_walk_forward(self, settings:CalibrationSettings) -> tuple[dict, dict, int, int]:
+        """Recomputes every stored point by hand from the raw forecasts, in time order as the forecast tool goes.
+        Returns the raw and calibrated forecasts, the points checked, and how many of them used the range offsets of
+        their status at the forecast time that differ from those of the whole horizon."""
+        def offset(scores:list) -> float:                   # conformal: the 90% tail of n + 1, never narrowing
+            k = math.ceil(Fraction(9, 10) * (len(scores) + 1))
+            return max(sorted(scores)[k - 1], 0) if k <= len(scores) else math.inf
+
+        def offsets(examples:list) -> tuple[float, float]:
+            return offset([e[4] - e[6] for e in examples]), offset([e[6] - e[5] for e in examples])
+
+        raw = self.run_forecast(self.plan, CalibrationSettings(enabled=False))
+        calibrated = self.run_forecast(self.plan, settings)
+        grid, top = self.plan.grid, 3
+        entries = {(vehicle, entry["t"]): entry["q"] for vehicle, items in raw["vehicles"].items() for entry in items}
+        stored = {(vehicle, entry["t"]): entry["q"] for vehicle, items in calibrated["vehicles"].items() for entry in items}
+        examples = [[] for _ in range(self.plan.points)]    # past raw forecasts: (target slot, bus, L, median, low, high, y)
+        checked = per_status = 0
+        for slot, vehicles in self.plan.origins:
+            t = float(grid.times[slot])
+            for h in range(self.plan.points):
+                past = [e for e in examples[h] if e[0] <= slot]
+                for vehicle in vehicles:
+                    q_raw, q = entries[(vehicle, t)], stored[(vehicle, t)]
+                    level = float(grid.levels[vehicle][slot])
+                    if len(past) < settings.min_points or len({e[1] for e in past}) < settings.min_buses:
+                        self.assertEqual([row[h] for row in q], [row[h] for row in q_raw])
+                        continue
+                    move = np.array([e[3] - e[2] for e in past])
+                    happened = np.array([e[6] - e[2] for e in past])
+                    w = float(np.clip((move * happened).sum() / (move * move).sum(), 0, 1))
+                    q_low, q_high = offsets(past)
+                    same_status = [e for e in past if e[2] == level]     # same status at the forecast time
+                    if len(same_status) >= settings.cell_min_points and \
+                            len({e[1] for e in same_status}) >= settings.cell_min_buses:
+                        per_status += offsets(same_status) != (q_low, q_high)
+                        q_low, q_high = offsets(same_status)
+                    median = round(min(max(level + w * (q_raw[1][h] - level), 0), top), 2)
+                    expected = (round(min(max(min(q_raw[0][h] - q_low, median), 0), top), 2), median,
+                                round(min(max(max(q_raw[2][h] + q_high, median), 0), top), 2))
+                    self.assertEqual((q[0][h], q[1][h], q[2][h]), expected, (vehicle, slot, h))
+                    checked += 1
+            for vehicle in vehicles:                        # recorded after the forecasts of this origin
+                q_raw = entries[(vehicle, t)]
+                for h in range(self.plan.points):
+                    target = slot + self.plan.point_slots * (h + 1)
+                    if target < grid.slots and np.isfinite(grid.levels[vehicle][target]):
+                        examples[h].append((target, vehicle, float(grid.levels[vehicle][slot]), q_raw[1][h], q_raw[0][h],
+                                            q_raw[2][h], float(grid.levels[vehicle][target])))
+        return raw, calibrated, checked, per_status
+
+    def test_range_offsets_per_status_at_the_forecast_time(self):
+        # Low thresholds: statuses with enough past examples get their own range offsets, the others the horizon's
+        _, _, checked, per_status = self.check_walk_forward(
+            CalibrationSettings(min_points=6, min_buses=2, cell_min_points=10, cell_min_buses=2))
+        self.assertGreater(checked, 50)
+        self.assertGreater(per_status, 20)
+
+    def test_stored_forecasts_follow_the_walk_forward_formulas(self):
+        raw, calibrated, checked, per_status = self.check_walk_forward(self.SETTINGS)
+        self.assertEqual(per_status, 0)
+        self.assertGreater(checked, 50)
+        for entries in calibrated["vehicles"].values():
+            for entry in entries:
+                for low, median, high in zip(*entry["q"]):
+                    self.assertTrue(0 <= low <= median <= high <= 3)
+                    self.assertEqual((low, median, high), (round(low, 2), round(median, 2), round(high, 2)))
+        self.assertEqual(calibrated["model_name"], "Fake-1M + calibration")
+        self.assertEqual(calibrated["metrics_raw"], raw["metrics"])
+        info = calibrated["calibration"]
+        self.assertEqual((len(info["first_t"]), len(info["final"]), len(info["history"]["t"])),
+                         (self.plan.points, self.plan.points, len(self.plan.origins)))
+        self.assertTrue(0 < info["calibrated_share"] < 1)
+        json.dumps(calibrated, allow_nan=False)
+
+    def test_a_forecast_never_uses_what_happens_after_it(self):
+        before = self.run_forecast(self.plan, self.SETTINGS)
+        cut = 20                                            # change every status after slot 20, the next one included
+        changed = {vehicle: statuses[:cut + 1] + [5 if s == 1 else 1 for s in statuses[cut + 1:]]
+                   for vehicle, statuses in self.series.items()}
+        plan = plan_forecast(series_replay(changed), ForecastSettings(horizon=120, origin_every=30, min_history=30))
+        self.assertEqual(plan.grid.statuses, self.plan.grid.statuses)      # same scale
+        after = self.run_forecast(plan, self.SETTINGS)
+        t_cut = float(self.plan.grid.times[cut])
+        compared = 0
+        for vehicle, entries in before["vehicles"].items():
+            for old, new in zip(entries, after["vehicles"][vehicle]):
+                if old["t"] <= t_cut:
+                    self.assertEqual(old, new)
+                    compared += 1
+        self.assertGreater(compared, 10)
+        self.assertNotEqual(before["vehicles"], after["vehicles"])
+
+    def test_too_few_past_outcomes_keeps_the_raw_output(self):
+        raw = self.run_forecast(self.plan, CalibrationSettings(enabled=False))
+        for settings in (CalibrationSettings(), CalibrationSettings(enabled=False)):     # 4 buses: below 20
+            with self.subTest(settings=settings):
+                forecast = self.run_forecast(self.plan, settings)
+                self.assertEqual((forecast["vehicles"], forecast["metrics"], forecast["model_name"]),
+                                 (raw["vehicles"], raw["metrics"], "Fake-1M"))
+                self.assertNotIn("metrics_raw", forecast)
+                self.assertNotIn("calibration", forecast)
+
+    def test_a_model_whose_moves_never_happen_is_not_trusted(self):
+        # Statuses never change, the model always predicts a rise: w = 0, so the calibrated median is the current level
+        plan = plan_forecast(series_replay({"a": [1] * 30, "b": [2] * 30, "c": [3] * 30}),
+                             ForecastSettings(horizon=120, origin_every=30, min_history=30))
+        forecast = self.run_forecast(plan, self.SETTINGS)
+        weights = [w for row in forecast["calibration"]["history"]["w"] for w in row if w is not None]
+        self.assertTrue(weights and all(w == 0 for w in weights))
+        for vehicle, entries in forecast["vehicles"].items():
+            level = {"a": 0, "b": 1, "c": 2}[vehicle]
+            for entry, w_row in zip(entries, forecast["calibration"]["history"]["w"]):
+                for h, w in enumerate(w_row):
+                    if w is not None:
+                        self.assertEqual(entry["q"][1][h], level)
+
+    def test_conformal_offset(self):
+        self.assertEqual(conformal_offset(np.arange(1.0, 10.0)), 9.0)           # n = 9: the 9th smallest
+        self.assertEqual(conformal_offset(np.arange(100.0)), 90.0)              # n = 100: the 91st smallest
+        self.assertEqual(conformal_offset(np.arange(1.0, 9.0)), math.inf)       # n = 8: there is no 9th
+        self.assertEqual(conformal_offset(np.full(20, -1.0)), 0.0)              # never narrows the range
+        self.assertEqual(conformal_offset(np.empty(0)), math.inf)
+
+
 class ModelTest(TempDirTestCase):
 
     def test_model_aliases(self):
@@ -451,8 +599,10 @@ class ForecastCommandTest(TempDirTestCase):
                 for low, median, high in zip(*entry["q"]):
                     self.assertTrue(0 <= low <= median <= high <= 3)        # ranks of the 4 statuses
         self.assertEqual(stored["metrics"]["mae"], stored["metrics"]["mae_last_value"])
-        for expected in ("Saved the forecast in", "right:    model", "\"no change\" baseline", "steps on average",
-                         "inside the 80% range", "MANY_SEATS_AVAILABLE, FEW_SEATS_AVAILABLE, STANDING_ROOM_ONLY, FULL",
+        # Two buses: never enough past outcomes to calibrate (200 from 20 buses), so the raw output is stored
+        self.assertEqual(("metrics_raw" in stored, "calibration" in stored), (False, False))
+        for expected in ("Saved the forecast in", "calibrated: none", "Fake-1M", "\"no change\"", "right", "error (steps)",
+                         "80% range holds", "MANY_SEATS_AVAILABLE, FEW_SEATS_AVAILABLE, STANDING_ROOM_ONLY, FULL",
                          "Next step"):
             self.assertIn(expected, stdout)
         self.assertNotIn("replaced", stdout)
@@ -490,9 +640,31 @@ class ForecastCommandTest(TempDirTestCase):
             self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_percentages_round_half_up_like_the_viewer(self):
-        from recording.cli import _percent_text
+        from recording.cli import _accuracy_text, _percent_text
         self.assertEqual([_percent_text(value) for value in (0.725, 0.745, 0.7296, 0.0, 1.0, None)],
                          ["73%", "75%", "73%", "0%", "100%", "n/a"])
+        # Accuracies get one decimal: 0.740 and 0.743 must not both print as 74%
+        self.assertEqual([_accuracy_text(value) for value in (0.74, 0.743, 0.7255, None)],
+                         ["74.0%", "74.3%", "72.6%", "n/a"])
+
+    def test_a_calibrated_forecast_prints_its_scores_beside_the_raw_ones(self):
+        from recording.cli import _percent_text
+        # Thresholds low enough for the 2 test buses (run_forecast takes CalibrationSettings from recording.forecast)
+        with mock.patch("recording.forecast.CalibrationSettings",
+                        functools.partial(CalibrationSettings, min_points=6, min_buses=2)):
+            code, stdout, _ = self.forecast()
+        self.assertEqual(code, 0)
+        stored = json.loads(self.path.read_text(encoding="utf-8"))["forecast"]
+        self.assertEqual(stored["model_name"], "Fake-1M + calibration")
+        self.assertIn(f"calibrated: {_percent_text(stored['calibration']['calibrated_share'])} of the stored points "
+                      f"(a forecast point is calibrated once it has 6 past outcomes from 2 buses)", stdout)
+        self.assertRegex(stdout, r"calibrated +raw Fake-1M +\"no change\"")
+        self.assertRegex(stdout, r"right( +\d+\.\d%){3}\n")
+        self.assertRegex(stdout, r"80% range holds( +\d+%){3}\n")
+
+    def test_no_calibration_option(self):
+        self.assertFalse(build_parser().parse_args(["forecast", "x.json"]).no_calibration)
+        self.assertTrue(build_parser().parse_args(["forecast", "x.json", "--no-calibration"]).no_calibration)
 
     def test_cli_defaults_are_those_of_the_module(self):
         args = build_parser().parse_args(["forecast", "x.json"])
