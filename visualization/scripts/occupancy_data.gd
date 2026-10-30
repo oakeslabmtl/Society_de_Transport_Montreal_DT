@@ -9,9 +9,7 @@ const FORECAST_FORMAT := "stm-dt-occupancy-forecast"
 const FORECAST_VERSION := 2 # Values are ranks of the statuses in "levels"; version 1 stored status values
 const LIVE_KEEP_SECONDS := 7200.0
 const STALE_ORIGINS := 2.0 # A forecast older than this many origin intervals is not current any more
-const TIME_EPSILON := 0.01 # Seconds: frame and origin times may differ by rounding
 
-var is_replay := false
 var occupancy_known := false # At least one observation has a level (status 0..5)
 var statuses_seen := {} # status (Occupancy.NO_DATA excluded) -> true, for the legend
 var statuses_version := 0 # Incremented when statuses_seen or the forecast's levels change (legend and chart rows)
@@ -19,12 +17,14 @@ var forecast_in_replay := false # The replay has a "forecast" key (valid or not)
 var has_forecast := false # ... and it is valid
 var forecast_error := "" # Why the forecast was ignored (human-readable), "" when valid or absent
 var model_name := ""
+var base_model_name := "" # model_name without " + calibration": the model itself
 var quantiles := PackedFloat64Array()
 var forecast_levels := PackedInt32Array() # Status of each forecast rank: rank r stands for forecast_levels[r]
 var metrics := {} # Contract metrics; values are floats or null
 var metrics_raw := {} # Same keys, for the model's raw output when the stored forecast is calibrated ({} otherwise)
 var calibration := {} # The forecast's "calibration" key when valid ({} otherwise): what the calibration learned
-var _calibrated_from := PackedFloat64Array() # Per forecast point: unix time of its first calibrated forecast (INF: never)
+var training := {} # The forecast's "training" key when valid ({} otherwise): how the location model learned
+var _learned_from := PackedFloat64Array() # Per forecast point: unix time of its first calibrated or model forecast (INF: never)
 var horizon := 600.0
 var point_every := 30.0
 var origin_every := 60.0
@@ -41,18 +41,12 @@ var _median_index := 0
 ## Vehicle id of an entity as used for bus node names ("" when missing)
 static func vehicle_key(entity: Dictionary) -> String:
 	var value = entity.get("vehicle.vehicle.id", entity.get("id"))
-	if value == null:
-		return ""
-	if value is float and value == floor(value):
-		return str(int(value))
-	return str(value)
+	return "" if value == null else Occupancy.int_text(value)
 
 ## Route id of an entity as text ("51", not "51.0"; "" when missing)
 static func route_key(entity: Dictionary) -> String:
 	var route = entity.get("vehicle.trip.route_id")
-	if route == null:
-		return ""
-	return str(int(route)) if route is float and route == floor(route) else str(route)
+	return "" if route == null else Occupancy.int_text(route)
 
 ## Direction (0 or 1) of an entity's trip, -1 when unknown
 static func direction_key(entity: Dictionary) -> int:
@@ -75,7 +69,6 @@ func clear() -> void:
 ## Rebuilds the store from the replay loaded in player (a ReplayPlayer)
 func load_replay(player: Node) -> void:
 	clear()
-	is_replay = true
 	# Plain arrays while collecting (appending to a packed array stored in a dictionary copies it)
 	var collected := {}
 	var times: PackedFloat64Array = player.get_frame_times()
@@ -91,7 +84,6 @@ func load_replay(player: Node) -> void:
 
 ## Live mode: records the entities of one message, observed at now_unix
 func record_live(entities: Array, now_unix: float) -> void:
-	is_replay = false
 	var collected := {}
 	_collect(collected, entities, now_unix)
 	var cutoff := now_unix - LIVE_KEEP_SECONDS
@@ -137,12 +129,12 @@ func route_at(vehicle_id: String, unix_time: float) -> String:
 	if routes.is_empty():
 		return ""
 	var route_times: PackedFloat64Array = history["route_times"]
-	var index := route_times.bsearch(unix_time + TIME_EPSILON, false) - 1
+	var index := route_times.bsearch(unix_time + Occupancy.TIME_EPSILON, false) - 1
 	return routes[maxi(index, 0)]
 
 ## Status of the latest observation at or before unix_time (Occupancy.NO_DATA when none)
 func status_at(vehicle_id: String, unix_time: float) -> int:
-	var index := history_times(vehicle_id).bsearch(unix_time + TIME_EPSILON, false) - 1
+	var index := history_times(vehicle_id).bsearch(unix_time + Occupancy.TIME_EPSILON, false) - 1
 	return history_statuses(vehicle_id)[index] if index >= 0 else Occupancy.NO_DATA
 
 ## Time of the vehicle's first observed level (status 0..5) at or before unix_time, or -1.0 when none
@@ -150,7 +142,7 @@ func first_known_time(vehicle_id: String, unix_time: float) -> float:
 	var times := history_times(vehicle_id)
 	var statuses := history_statuses(vehicle_id)
 	for i in times.size():
-		if times[i] > unix_time + TIME_EPSILON:
+		if times[i] > unix_time + Occupancy.TIME_EPSILON:
 			break
 		if Occupancy.is_level(statuses[i]):
 			return times[i]
@@ -187,7 +179,7 @@ func forecast_at(vehicle_id: String, now_unix: float):
 		return null
 	var entry: Dictionary = _forecasts[vehicle_id]
 	var origins: PackedFloat64Array = entry["origins"]
-	var index := origins.bsearch(now_unix + TIME_EPSILON, false) - 1
+	var index := origins.bsearch(now_unix + Occupancy.TIME_EPSILON, false) - 1
 	if index < 0 or now_unix - origins[index] > minf(STALE_ORIGINS * origin_every, horizon):
 		return null
 	var rows: Array = entry["rows"][index]
@@ -231,12 +223,14 @@ func _reset_forecast() -> void:
 	has_forecast = false
 	forecast_error = ""
 	model_name = ""
+	base_model_name = ""
 	quantiles = PackedFloat64Array()
 	forecast_levels = PackedInt32Array()
 	metrics = {}
 	metrics_raw = {}
 	calibration = {}
-	_calibrated_from = PackedFloat64Array()
+	training = {}
+	_learned_from = PackedFloat64Array()
 	vehicle_count = 0
 	origin_count = 0
 	_forecasts = {}
@@ -249,7 +243,7 @@ func _load_forecast(meta: Dictionary) -> void:
 	if not forecast_in_replay:
 		return
 	var start_time = meta.get("start_time")
-	var error := "the replay has no numeric \"start_time\"" if not _is_number(start_time) else _parse_forecast(meta["forecast"], float(start_time))
+	var error := "the replay has no numeric \"start_time\"" if not Occupancy.is_number(start_time) else _parse_forecast(meta["forecast"], float(start_time))
 	if error != "":
 		_reset_forecast()
 		forecast_error = "Forecast ignored: " + error
@@ -264,14 +258,14 @@ func _parse_forecast(raw, start_time: float) -> String:
 	if raw.get("format") != FORECAST_FORMAT:
 		return "format is %s, expected \"%s\"" % [str(raw.get("format")), FORECAST_FORMAT]
 	var version = raw.get("version")
-	if _is_number(version) and int(version) == 1:
+	if Occupancy.is_number(version) and int(version) == 1:
 		return "it was made by an older forecast tool (version 1): run the forecast command on the replay again"
-	if not _is_number(version) or int(version) != FORECAST_VERSION:
+	if not Occupancy.is_number(version) or int(version) != FORECAST_VERSION:
 		return "unsupported forecast version %s (this build reads version %d)" % [str(version), FORECAST_VERSION]
 	for key in ["point_every", "horizon", "origin_every"]:
-		if not _is_number(raw.get(key)) or float(raw.get(key)) <= 0.0:
+		if not Occupancy.is_number(raw.get(key)) or float(raw.get(key)) <= 0.0:
 			return "\"%s\" must be a positive number of seconds" % key
-	if not _is_number(raw.get("min_history", 0.0)) or float(raw.get("min_history", 0.0)) < 0.0:
+	if not Occupancy.is_number(raw.get("min_history", 0.0)) or float(raw.get("min_history", 0.0)) < 0.0:
 		return "\"min_history\" must be a number of seconds"
 	point_every = float(raw["point_every"])
 	horizon = float(raw["horizon"])
@@ -279,13 +273,13 @@ func _parse_forecast(raw, start_time: float) -> String:
 	min_history = float(raw.get("min_history", 0.0))
 	var point_count := roundi(horizon / point_every)
 	if point_count < 1 or absf(point_count * point_every - horizon) > 0.01:
-		return "horizon %s s is not a multiple of point_every %s s" % [_number_text(horizon), _number_text(point_every)]
+		return "horizon %s s is not a multiple of point_every %s s" % [Occupancy.int_text(horizon), Occupancy.int_text(point_every)]
 
 	var raw_levels = raw.get("levels")
 	if not raw_levels is Array or raw_levels.is_empty():
 		return "\"levels\" must be a non-empty list of occupancy statuses"
 	for value in raw_levels:
-		if not _is_number(value) or value != floorf(value) or not Occupancy.is_level(int(value)) or (not forecast_levels.is_empty() and int(value) <= forecast_levels[forecast_levels.size() - 1]):
+		if not Occupancy.is_number(value) or value != floorf(value) or not Occupancy.is_level(int(value)) or (not forecast_levels.is_empty() and int(value) <= forecast_levels[forecast_levels.size() - 1]):
 			return "\"levels\" must be increasing occupancy statuses between 0 and %d, got %s" % [Occupancy.MAX_LEVEL, str(raw_levels)]
 		forecast_levels.append(int(value))
 
@@ -293,7 +287,7 @@ func _parse_forecast(raw, start_time: float) -> String:
 	if not raw_quantiles is Array or raw_quantiles.is_empty():
 		return "\"quantiles\" must be a non-empty list"
 	for value in raw_quantiles:
-		if not _is_number(value) or float(value) <= 0.0 or float(value) >= 1.0 or (not quantiles.is_empty() and float(value) <= quantiles[quantiles.size() - 1]):
+		if not Occupancy.is_number(value) or float(value) <= 0.0 or float(value) >= 1.0 or (not quantiles.is_empty() and float(value) <= quantiles[quantiles.size() - 1]):
 			return "\"quantiles\" must be increasing numbers between 0 and 1, got %s" % str(raw_quantiles)
 		quantiles.append(float(value))
 	for j in quantiles.size():
@@ -311,9 +305,9 @@ func _parse_forecast(raw, start_time: float) -> String:
 		var pairs: Array = []
 		for i in entries.size():
 			var entry = entries[i]
-			if not entry is Dictionary or not _is_number(entry.get("t")):
+			if not entry is Dictionary or not Occupancy.is_number(entry.get("t")):
 				return "vehicle %s, forecast %d: expected {\"t\": number, \"q\": [...]}" % [vehicle_id, i]
-			var where := "vehicle %s at t=%s" % [vehicle_id, _number_text(entry["t"])]
+			var where := "vehicle %s at t=%s" % [vehicle_id, Occupancy.int_text(entry["t"])]
 			var q = entry.get("q")
 			if not q is Array or q.size() != quantiles.size():
 				return "%s: \"q\" has %s rows, expected %d (one per quantile)" % [where, str(q.size()) if q is Array else "no", quantiles.size()]
@@ -323,7 +317,7 @@ func _parse_forecast(raw, start_time: float) -> String:
 				if not row is Array or row.size() != point_count:
 					return "%s: q[%d] has %s values, expected %d" % [where, j, str(row.size()) if row is Array else "no", point_count]
 				for value in row:
-					if not _is_number(value):
+					if not Occupancy.is_number(value):
 						return "%s: q[%d] contains %s (not a number)" % [where, j, str(value)]
 				rows.append(PackedFloat64Array(row))
 			pairs.append([start_time + float(entry["t"]), rows])
@@ -341,60 +335,82 @@ func _parse_forecast(raw, start_time: float) -> String:
 	model_name = str(raw.get("model_name", raw.get("model", ""))).strip_edges()
 	if model_name == "":
 		model_name = "an unnamed model"
+	base_model_name = model_name.trim_suffix(" + calibration")
 	var raw_metrics = raw.get("metrics")
 	metrics = raw_metrics if raw_metrics is Dictionary else {}
 	vehicle_count = _forecasts.size()
 	origin_count = origins_seen.size()
-	# Optional (calibrated forecasts): never a reason to drop the forecast itself
+	# Optional (calibrated forecasts, the location model): never a reason to drop the forecast itself
 	var raw_model_metrics = raw.get("metrics_raw")
 	metrics_raw = raw_model_metrics if raw_model_metrics is Dictionary else {}
-	if raw.has("calibration"):
-		var error := _parse_calibration(raw["calibration"], start_time, point_count)
-		if error != "":
-			calibration = {}
-			_calibrated_from = PackedFloat64Array()
-			push_warning("Occupancy: forecast calibration details ignored: " + error)
+	for key in ["calibration", "training"]:
+		if raw.has(key):
+			var error := _parse_learning(key, raw[key], start_time, point_count)
+			if error != "":
+				_learned_from = PackedFloat64Array()
+				push_warning("Occupancy: forecast %s details ignored: %s" % [key, error])
 	return ""
 
-## Reads the forecast's optional "calibration" key into calibration and _calibrated_from; returns an error or ""
-func _parse_calibration(raw, start_time: float, point_count: int) -> String:
+## Reads the forecast's optional "calibration" or "training" key (what a calibration or the location model learned)
+## into calibration or training, and _learned_from; returns an error or ""
+func _parse_learning(key: String, raw, start_time: float, point_count: int) -> String:
+	_learned_from = PackedFloat64Array()
 	if not raw is Dictionary:
 		return "not an object"
 	var first_t = raw.get("first_t")
 	if not first_t is Array or first_t.size() != point_count:
 		return "\"first_t\" must have one entry per forecast point"
 	for value in first_t:
-		if value != null and not _is_number(value):
+		if value != null and not Occupancy.is_number(value):
 			return "\"first_t\" must hold numbers or null"
-		_calibrated_from.append(start_time + float(value) if value != null else INF)
+		_learned_from.append(start_time + float(value) if value != null else INF)
+	var per_time := "w" if key == "calibration" else "examples" # What history holds per forecast time
 	var history = raw.get("history")
-	if not history is Dictionary or not history.get("t") is Array or not history.get("w") is Array \
-			or history["t"].size() != history["w"].size():
-		return "\"history\" must have as many weight rows as times"
-	for row in history["w"]:
-		if not row is Array or row.size() != point_count or row.any(func(w): return w != null and not _is_number(w)):
+	if not history is Dictionary or not history.get("t") is Array or not history.get(per_time) is Array \
+			or history["t"].size() != history[per_time].size() or history["t"].any(func(t): return not Occupancy.is_number(t)):
+		return "\"history\" must have as many \"%s\" entries as times" % per_time
+	var error := _check_calibration(raw, point_count) if key == "calibration" else _check_training(raw)
+	if error == "":
+		if key == "calibration":
+			calibration = raw
+		else:
+			training = raw
+	return error
+
+static func _check_calibration(raw: Dictionary, point_count: int) -> String:
+	for row in raw["history"]["w"]:
+		if not row is Array or row.size() != point_count or row.any(func(w): return w != null and not Occupancy.is_number(w)):
 			return "each \"history.w\" row must hold one number or null per forecast point"
 	var final = raw.get("final")
 	if not final is Array or final.size() != point_count:
 		return "\"final\" must have one entry per forecast point"
 	for entry in final:
-		if entry != null and (not entry is Dictionary or not _is_number(entry.get("w")) or not _is_number(entry.get("examples")) \
-				or not _is_number(entry.get("buses"))):
+		if entry != null and (not entry is Dictionary or not Occupancy.is_number(entry.get("w")) \
+				or not Occupancy.is_number(entry.get("examples")) or not Occupancy.is_number(entry.get("buses"))):
 			return "each \"final\" entry must be null or have numbers w, examples and buses"
-	calibration = raw
 	return ""
 
-## True when some points of the calibrated forecast made at origin_unix are still the raw model output: their
-## calibration had too few past outcomes yet (false for a forecast that was not calibrated at all)
-func calibration_learning(origin_unix: float) -> bool:
-	for first in _calibrated_from:
-		if origin_unix + TIME_EPSILON < first:
-			return true
-	return false
+static func _check_training(raw: Dictionary) -> String:
+	if raw["history"]["examples"].any(func(n): return not Occupancy.is_number(n)):
+		return "\"history.examples\" must hold numbers"
+	for key in ["min_points", "min_buses", "min_points_per_point", "min_points_per_status", "model_share", "position_known", "stop_known"]:
+		if not Occupancy.is_number(raw.get(key)):
+			return "\"%s\" must be a number" % key
+	var final = raw.get("final")
+	if final != null and (not final is Dictionary or not Occupancy.is_number(final.get("examples")) \
+			or not Occupancy.is_number(final.get("buses"))):
+		return "\"final\" must be null or have numbers examples and buses"
+	return ""
 
-static func _is_number(value) -> bool:
-	return value is float or value is int
+## What the chart says while some points of the forecast made at origin_unix have not learned yet: they are the raw
+## model output (calibration) or "no change" (location model); "" otherwise
+func learning_note(origin_unix: float) -> String:
+	for first in _learned_from:
+		if origin_unix + Occupancy.TIME_EPSILON < first:
+			return "calibration still learning" if not calibration.is_empty() else "model still learning"
+	return ""
 
-## "60" rather than "60.0" in messages
-static func _number_text(value) -> String:
-	return str(int(value)) if value is float and value == floorf(value) else str(value)
+## The forecast's "calibration" or "training" key, whichever it has ({} if none)
+func learned() -> Dictionary:
+	return calibration if not calibration.is_empty() else training
+

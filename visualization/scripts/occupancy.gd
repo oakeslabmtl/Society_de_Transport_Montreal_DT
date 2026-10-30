@@ -8,7 +8,6 @@ extends RefCounted
 const KEY := "vehicle.occupancy_status"
 const NO_DATA := -1 # Missing, unknown, or NO_DATA_AVAILABLE (7)
 const MAX_LEVEL := 5 # FULL: 0..5 say how full the bus is, 6 and 8 that it cannot be boarded
-const NOT_ACCEPTING_PASSENGERS := 6
 const NO_DATA_AVAILABLE := 7
 const NOT_BOARDABLE := 8
 ## Spec names, by value
@@ -23,6 +22,8 @@ const NO_DATA_LABEL := "No data"
 const COLORS := [Color("#66da85"), Color("#02721c"), Color("#fed25f"), Color("#f27700"), Color("#d02e1e"), Color("#77010f"),
 	Color("#6b359b"), Color("#868686"), Color("#6b359b")]
 const NO_DATA_COLOR := Color("#868686")
+const SELECTED_COLOR := Color("#3987e5") # The selected bus: its outline and its chart, apart from the status colors
+const TIME_EPSILON := 0.01 # Seconds: frame and forecast times may differ by rounding
 # Godot's filmic tonemap curve (exposure bias 2 baked into A and B, as in Godot's tonemap shader)
 const FILMIC_A := 0.22 * 4.0
 const FILMIC_B := 0.30 * 2.0
@@ -57,6 +58,14 @@ static func status_of(value) -> int:
 ## True for the statuses that say how full the bus is (0..5): the ones the chart and the forecast use
 static func is_level(status: int) -> bool:
 	return status >= 0 and status <= MAX_LEVEL
+
+## True for a JSON number (JSON numbers are floats in Godot, ints when set from code)
+static func is_number(value) -> bool:
+	return value is float or value is int
+
+## A whole number as text without ".0" ("51" for 51.0, e.g. a route or bus id read from JSON); anything else as str()
+static func int_text(value) -> String:
+	return str(int(value)) if value is int or (value is float and value == floorf(value)) else str(value)
 
 static func label(status: int) -> String:
 	return LABELS[status] if status >= 0 and status < LABELS.size() else NO_DATA_LABEL

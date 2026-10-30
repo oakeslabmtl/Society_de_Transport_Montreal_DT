@@ -1,8 +1,8 @@
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
+from recording.paths import write_text_atomic
 from recording.store import RecordingStore, sort_routes, utc_now_iso
 from recording.timeline import Window, local_datetime, utc_offset_seconds
 
@@ -28,7 +28,7 @@ class ExportResult:
 def build_replay(store:RecordingStore, window:Window, name:str=None, routes:list[str]=None) -> ExportResult:
     """Replay dict for the polls of `window`: one frame (a full snapshot of the recorded routes) per poll."""
     meta = store.meta
-    tz = meta.get("timezone", "America/Montreal")
+    tz = meta["timezone"]
     wanted = {str(route) for route in routes} if routes else None
     entities_by_poll = store.entities_by_poll(window.polls)
 
@@ -61,7 +61,7 @@ def build_replay(store:RecordingStore, window:Window, name:str=None, routes:list
         "start_time": window.start_time,
         "end_time": window.end_time,
         "duration": window.duration,
-        "poll_interval": meta.get("poll_interval_s", 15.0),
+        "poll_interval": meta["poll_interval_s"],
         "routes": [int(route) for route in route_list] if all(r.isdigit() for r in route_list) else route_list,
         "vehicle_count": len(vehicles),
         "frames": frames,
@@ -71,13 +71,7 @@ def build_replay(store:RecordingStore, window:Window, name:str=None, routes:list
 
 def write_replay(replay:dict, path:Path) -> int:
     """Compact UTF-8 JSON, written atomically. Returns the file size in bytes."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(replay, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(text.encode("utf-8"))
-    os.replace(temporary, path)
-    return path.stat().st_size
+    return write_text_atomic(json.dumps(replay, separators=(",", ":"), ensure_ascii=False, allow_nan=False), path)
 
 
 def default_replay_name(window:Window, tz:str, routes:list[str]) -> str:

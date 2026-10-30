@@ -7,12 +7,12 @@ import time
 from pathlib import Path
 from recording import NothingToForecast, RecordingError
 from recording.paths import DATASETS_DIR, RECORDINGS_DIR, REPLAYS_DIR, ROOT, ROUTE_STOPS_FILE, display_path, repo_relative
-from recording.store import TIMEZONE, RecordingStore, sort_routes
+from recording.store import DEFAULT_POLL_INTERVAL, OCCUPANCY_LABELS, TIMEZONE, RecordingStore, sort_routes
 from recording.timeline import (format_clock, format_duration, format_span, local_datetime, parse_local_time, select_window,
                                 start_option)
 
-DEFAULT_INTERVAL_S = 15.0   # same as communication.protocol.EXECUTION_INTERVAL (not imported: it needs STM_API_KEY)
 PROGRAM = "python -m recording"
+LOCATION_MODEL = "location"  # forecast --model value of the location model (recording.location_model)
 
 DESCRIPTION = """\
 Record STM bus positions and turn them into replays for the 3D viewer (no RabbitMQ, MongoDB or Docker needed).
@@ -21,7 +21,8 @@ Record STM bus positions and turn them into replays for the 3D viewer (no Rabbit
      import-csv  or convert a MongoDB CSV export (e.g. datasets/20250301-buses.csv) into a recording
   2. info        see what a recording contains and its best time windows
   3. export      write a replay .json (default: visualization/replays/, bundled into the demo build)
-  4. forecast    optional: add occupancy forecasts to a replay, for the viewer's bus chart (needs Timestral)
+  4. forecast    optional: add occupancy forecasts to a replay, for the viewer's bus chart (needs Timestral,
+                 or --model location: the location model, numpy only)
 
   route-stops    the stops of every bus line and direction, highlighted by the viewer for the selected bus
                  (from the static GTFS in datasets/; run it again when the GTFS is updated)
@@ -77,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--routes", default="", help='bus routes to keep, e.g. "24,51,55,80,129,165" (default: all routes); '
                                                      'the 3D map covers downtown Montreal only')
     record.add_argument("--minutes", type=float, help="how long to record (default: until Ctrl+C)")
-    record.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S, help="seconds between polls (default: %(default)g)")
+    record.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL, help="seconds between polls (default: %(default)g)")
     record.add_argument("--name", help="recording name (default: stm_<YYYY-MM-DD_HHMM>_routes-<routes>)")
     record.add_argument("--out", help="output .sqlite path (default: recordings/<name>.sqlite at the repo root)")
     record.add_argument("--export", action="store_true", help="also export the whole recording as a replay when done")
@@ -96,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_csv.add_argument("--out", help="output .sqlite path (default: recordings/<name>.sqlite at the repo root)")
     import_csv.add_argument("--cluster-gap", type=float, default=5.0,
                             help="rows inserted at most this many seconds apart are one poll (default: %(default)g)")
-    import_csv.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
+    import_csv.add_argument("--interval", type=float, default=DEFAULT_POLL_INTERVAL,
                             help="poll interval of the original recording, in seconds (default: %(default)g)")
     import_csv.add_argument("--force", action="store_true", help="replace the output file if it already exists")
     import_csv.set_defaults(handler=run_import_csv)
@@ -131,24 +132,32 @@ def build_parser() -> argparse.ArgumentParser:
     export.set_defaults(handler=run_export)
 
     forecast = commands.add_parser(
-        "forecast", parents=[common], formatter_class=formatter, help="add occupancy forecasts to a replay (Timestral)",
+        "forecast", parents=[common], formatter_class=formatter,
+        help="add occupancy forecasts to a replay (Timestral, or the location model)",
         description="Precompute occupancy forecasts with Timestral (a time-series model by Mistral AI) and store them in the\n"
                     "replay, for the chart shown when a bus is selected in the viewer (the demo exe runs no model).\n"
                     "Every --every-minutes of replay time, each bus with --min-history-minutes of occupancy history gets a\n"
-                    "forecast of the next --horizon-minutes, made only from what was observed until then. Each forecast\n"
-                    "point is then calibrated on the earlier forecasts whose outcome is known (walk-forward): how much to\n"
-                    "trust the model's predicted change, and how far to widen the 80% range so that each end held 90% of\n"
-                    "past outcomes (so that it holds at least 80%).\n"
+                    "forecast of the next --horizon-minutes, made only from what was observed until then. With Timestral,\n"
+                    "each forecast point is then calibrated on the earlier forecasts whose outcome is known (walk-forward):\n"
+                    "how much to trust the model's predicted change, and how far to widen the 80% range so that each end\n"
+                    "held 90% of past outcomes (so that it holds at least 80%).\n"
                     "The file is rewritten in place; an existing forecast is replaced.\n"
                     "Needs Timestral and PyTorch, best in their own environment (from the repo root, see the README):\n"
                     "  uv venv .venv-forecast --python 3.12\n"
-                    "  uv pip install --python .venv-forecast -r software\\recording\\requirements-forecast.in",
-        epilog="example (from the software/ folder, with the Python that has Timestral):\n"
-               "  ..\\.venv-forecast\\Scripts\\python -m recording forecast ../visualization/replays/<replay>.json")
+                    "  uv pip install --python .venv-forecast -r software\\recording\\requirements-forecast.in\n"
+                    "--model location uses the location model instead: a logistic regression that also knows where each\n"
+                    "bus is (trip position, metro stations ahead, the bus ahead on its line), learned from the replay\n"
+                    "itself as it goes (walk-forward, no change until it has enough outcomes). It needs numpy only, and\n"
+                    "the stop lists of route-stops for stations and the bus ahead.",
+        epilog="examples (from the software/ folder):\n"
+               "  ..\\.venv-forecast\\Scripts\\python -m recording forecast ../visualization/replays/<replay>.json\n"
+               "  python -m recording forecast ../visualization/replays/<replay>.json --model location")
     # Defaults: those of recording.forecast (not imported here: it needs numpy)
     forecast.add_argument("replay", metavar="REPLAY", help="the replay .json (rewritten in place)")
     forecast.add_argument("--model", default="28M", help="Timestral size: 5M, 28M, 123M or 209M (downloaded once: 21 MB "
-                                                         "to 837 MB), a Hugging Face repo id or a model folder "
+                                                         "to 837 MB), a Hugging Face repo id or a model folder, or "
+                                                         f"'{LOCATION_MODEL}' for the location model (a model folder "
+                                                         f"named {LOCATION_MODEL}: .\\{LOCATION_MODEL}) "
                                                          "(default: %(default)s)")
     forecast.add_argument("--horizon-minutes", type=float, default=10,
                           help="how far ahead each forecast goes (default: %(default)g)")
@@ -157,8 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
     forecast.add_argument("--min-history-minutes", type=float, default=2,
                           help="occupancy history a bus needs before its first forecast (default: %(default)g)")
     forecast.add_argument("--no-calibration", action="store_true",
-                          help="store the model's raw output (no walk-forward calibration)")
-    forecast.add_argument("--offline", action="store_true", help="only use a model already in the Hugging Face cache")
+                          help="store Timestral's raw output (no walk-forward calibration)")
+    forecast.add_argument("--offline", action="store_true",
+                          help="only use a Timestral model already in the Hugging Face cache")
     forecast.add_argument("--device", default="cpu", help='PyTorch device (default: %(default)s); "cuda" needs a CUDA build '
                                                           'of PyTorch (on Windows, the requirements install the CPU-only one)')
     forecast.set_defaults(handler=run_forecast)
@@ -218,9 +228,7 @@ def run_record(args) -> int:
           f"({result.polls - result.errors} ok, {result.errors} failed), {len(result.vehicles)} distinct vehicles.")
     print(f"Saved to {display_path(out)}")
     if args.export:
-        export_args = argparse.Namespace(recording=str(out), start=None, minutes=None, routes=None, name=None, out=None,
-                                         force=args.force, forecast=False)
-        return run_export(export_args)
+        return run_export(build_parser().parse_args(["export", str(out)] + (["--force"] if args.force else [])))
     info_hint = f'`{program_name()} info "{display_path(out)}"` shows what was recorded'
     print_next_step("turn it into a replay for the 3D viewer", f'{program_name()} export "{display_path(out)}" --name "My recording"',
                     f"(add --minutes 60 to keep only the best hour; {info_hint})" if result.elapsed >= 3600 else f"({info_hint})")
@@ -267,7 +275,7 @@ def run_info(args) -> int:
 
     with RecordingStore.open(args.recording) as store:
         lines, best = describe(store, minutes=args.minutes)
-        tz = store.meta.get("timezone", TIMEZONE)
+        tz = store.meta["timezone"]
         ok = store.polls("ok")
     print("\n".join(lines))
     if best:
@@ -285,10 +293,10 @@ def run_export(args) -> int:
 
     with RecordingStore.open(args.recording) as store:
         meta = store.meta
-        tz = meta.get("timezone", TIMEZONE)
+        tz = meta["timezone"]
         polls = store.polls("ok")
         start = parse_local_time(args.start, tz, polls) if args.start and polls else None
-        window, warnings = select_window(polls, meta.get("poll_interval_s", DEFAULT_INTERVAL_S), tz, start, args.minutes)
+        window, warnings = select_window(polls, meta["poll_interval_s"], tz, start, args.minutes)
         routes = parse_routes(args.routes) if args.routes else None
         if routes:
             recorded = [route for route in store.route_counts() if route]
@@ -344,22 +352,27 @@ def forecast_exported_replay(out:Path) -> int:
 
 def run_forecast(args) -> int:
     # numpy and Timestral are only needed here: the other commands work without them
-    from recording.forecast import (LEVELS, MODEL_SIZES, CalibrationSettings, ForecastSettings, compute_forecast,
-                                    load_forecaster, model_name, plan_forecast, read_replay, resolve_model, set_forecast)
-    from recording.replay import write_replay
+    from recording.forecast import ForecastSettings, plan_forecast, read_replay
 
     if args.horizon_minutes <= 0 or args.every_minutes <= 0 or args.min_history_minutes < 0:
         raise RecordingError("--horizon-minutes and --every-minutes must be greater than 0, --min-history-minutes at least 0.")
+    location = args.model.strip().lower() == LOCATION_MODEL
+    if location and args.no_calibration:
+        raise RecordingError("--no-calibration is for Timestral: the location model's forecast is not calibrated afterwards.")
     path = Path(args.replay)
     replay = read_replay(path)
     plan = plan_forecast(replay, ForecastSettings(horizon=args.horizon_minutes * 60, origin_every=args.every_minutes * 60,
                                                   min_history=args.min_history_minutes * 60))
     settings = plan.settings
-    tz = replay.get("timezone", TIMEZONE)
     print(f'Forecasting the occupancy in "{replay.get("name", path.stem)}"')
     print(f"  plan:     {plan.vehicles} buses at {len(plan.origins)} times (every {_minutes_text(settings.origin_every)}, "
           f"after {_minutes_text(settings.min_history)} of history), {_minutes_text(settings.horizon)} ahead, "
           f"a point every {settings.point_every:g} s")
+    return (run_location_forecast if location else run_timestral_forecast)(args, path, replay, plan)
+
+
+def run_timestral_forecast(args, path:Path, replay:dict, plan) -> int:
+    from recording.forecast import MODEL_SIZES, CalibrationSettings, compute_forecast, load_forecaster, model_name, resolve_model
 
     model_id = resolve_model(args.model)
     download = MODEL_SIZES.get(args.model.strip().upper())
@@ -373,34 +386,93 @@ def run_forecast(args) -> int:
     print(f"  loaded in {time.monotonic() - started:.1f} s", flush=True)
 
     started = time.monotonic()
-    width = len(str(len(plan.origins)))
+    calibration = CalibrationSettings(enabled=not args.no_calibration)
+    result = compute_forecast(plan, forecaster, on_progress=forecast_progress(replay, plan), calibration=calibration)
+    elapsed = time.monotonic() - started
+    raw = result.metrics_raw
+    needs = f"{calibration.min_points} past outcomes from {calibration.min_buses} buses"
+    if raw:
+        details = [f"  calibrated: {_percent_text(result.forecast['calibration']['calibrated_share'])} of the stored points "
+                   f"(a forecast point is calibrated once it has {needs})"]
+    elif calibration.enabled:
+        details = [f"  calibrated: none (no forecast point had {needs}): the raw model output is stored"]
+    else:
+        details = []
+    if result.skipped:
+        details.append(f"warning: {result.skipped} forecast(s) with NaN or infinite values were dropped.")
+    # Scores of the stored forecast, of the raw model output when it was calibrated, and of "no change"
+    columns = [("calibrated", result.metrics), (f"raw {forecaster.model_name}", raw)] if raw \
+        else [(forecaster.model_name, result.metrics)]
+    return save_forecast(path, replay, result, f"{forecaster.model_name} ({forecaster.model}), {elapsed:.0f} s", details,
+                         columns)
+
+
+def run_location_forecast(args, path:Path, replay:dict, plan) -> int:
+    """forecast --model location: the location model, trained on the replay itself (recording.location_model)."""
+    from recording.location_model import MODEL_NAME, LocationModelSettings, compute_location_forecast, load_route_stops
+
+    route_stops = load_route_stops(ROUTE_STOPS_FILE)
+    if route_stops is None:
+        print(f"  note: no stop lists ({display_path(ROUTE_STOPS_FILE)}): metro stations and the bus ahead are unknown "
+              f"(run route-stops)")
+    settings = LocationModelSettings()
+    print(f"Training the {MODEL_NAME.lower()} on the replay as it goes (walk-forward; numpy only, no Timestral)...",
+          flush=True)
+    started = time.monotonic()
+    result = compute_location_forecast(plan, replay, route_stops, settings, on_progress=forecast_progress(replay, plan))
+    elapsed = time.monotonic() - started
+
+    training = result.forecast["training"]
+    needs = (f"a forecast point needs {settings.min_points:,} past outcomes from {settings.min_buses} buses, "
+             f"{settings.min_points_per_point} at its horizon and {settings.min_points_per_status} at the bus's status")
+    if len(result.forecast["levels"]) < 2:
+        details = ["  learned:  nothing - the replay has a single occupancy status: there is no change to learn"]
+    elif training["final"] is None:
+        details = [f"  learned:  nothing - every stored point is \"no change\" ({needs}): use a longer replay or more routes"]
+    else:
+        details = [f"  learned:  the model made {_percent_text(training['model_share'])} of the stored points, the others "
+                   f"are \"no change\"\n            ({needs})"]
+    details.append(f"  position: trip position known for {_percent_text(training['position_known'])} of the forecasts "
+                   f"(direction and stop sequence),\n            stop on the line for "
+                   f"{_percent_text(training['stop_known'])} (for metro stations and the bus ahead)")
+    if training["position_known"] < 0.5:
+        details.append("  note: most buses have no vehicle.trip.direction_id or vehicle.current_stop_sequence (e.g. a "
+                       "replay imported\n        from a CSV): the model cannot use where they are on their trip")
+    elif training["stop_known"] < 0.5 and route_stops is not None:
+        details.append("  note: most buses have no vehicle.stop_id from their line's stop list: metro stations and the bus "
+                       "ahead are\n        unknown (run route-stops again if the GTFS changed)")
+    return save_forecast(path, replay, result, f"{MODEL_NAME} (logistic regression), {elapsed:.0f} s", details,
+                         [(MODEL_NAME, result.metrics)])
+
+
+def forecast_progress(replay:dict, plan):
+    """on_progress of a forecast that starts now: a line every 10 forecast times, with the time spent so far."""
+    started, width, tz = time.monotonic(), len(str(len(plan.origins))), replay.get("timezone", TIMEZONE)
 
     def progress(done:int, total:int, t:float, buses:int):
         if done % 10 == 0 or done == total:
             print(f"  [{done:>{width}}/{total}] {format_clock(replay['start_time'] + t, tz)}  {buses:>4} buses  "
                   f"{time.monotonic() - started:5.1f} s", flush=True)
+    return progress
 
-    calibration = CalibrationSettings(enabled=not args.no_calibration)
-    result = compute_forecast(plan, forecaster, on_progress=progress, calibration=calibration)
-    elapsed = time.monotonic() - started
+
+def save_forecast(path:Path, replay:dict, result, model:str, details:list[str], columns:list[tuple[str, dict]]) -> int:
+    """Stores the forecast in the replay file, then prints what was stored, the model's own details, the scores of each
+    (name, metrics) column and of "no change", and the next step."""
+    from recording.forecast import set_forecast
+    from recording.replay import write_replay
+
     previous = set_forecast(replay, result.forecast)
     size = write_replay(replay, path)
-
-    metrics, raw = result.metrics, result.metrics_raw
     replaced = f" - replaced the existing forecast (model {previous.get('model_name', '?')})" if isinstance(previous, dict) else ""
     print(f"\nSaved the forecast in {display_path(path)} ({size / 1e6:.1f} MB){replaced}")
-    print(f"  model:    {forecaster.model_name} ({forecaster.model}), {elapsed:.0f} s for {result.origins} forecast times")
+    print(f"  model:    {model} for {result.origins} forecast times")
     print(f"  stored:   {result.vehicles} buses, {result.forecasts:,} forecasts, {result.points:,} points")
-    if raw:
-        print(f"  calibrated: {_percent_text(result.forecast['calibration']['calibrated_share'])} of the stored points "
-              f"(a forecast point is calibrated once it has {calibration.min_points} past outcomes from "
-              f"{calibration.min_buses} buses)")
-    elif calibration.enabled:
-        print(f"  calibrated: none (no forecast point had {calibration.min_points} past outcomes from "
-              f"{calibration.min_buses} buses): the raw model output is stored")
-    # Scores of the stored forecast, of the raw model output when it was calibrated, and of "no change"
-    ahead = f"  at +{_minutes_text(settings.horizon)}"
-    columns = [("calibrated", metrics), (f"raw {forecaster.model_name}", raw)] if raw else [(forecaster.model_name, metrics)]
+    for line in details:
+        print(line)
+
+    metrics = result.metrics
+    ahead = f"  at +{_minutes_text(result.forecast['horizon'])}"
     print(f"\n  {'':<18}" + "".join(f"{name:>22}" for name, _ in columns) + f"{chr(34) + 'no change' + chr(34):>14}")
     for label, key, baseline, text in (("right", "accuracy", "accuracy_last_value", _accuracy_text),
                                        (ahead, "accuracy_at_horizon", "accuracy_last_value_at_horizon", _accuracy_text),
@@ -409,13 +481,10 @@ def run_forecast(args) -> int:
                                        ("80% range holds", "coverage", "accuracy_last_value", _percent_text)):
         print(f"  {label:<18}" + "".join(f"{text(values[key]):>22}" for _, values in columns)
               + f"{text(metrics[baseline]):>14}")
-    status_names = {value: name for name, value in LEVELS.items()}
-    scale = ", ".join(status_names.get(status, str(status)) for status in result.forecast["levels"])
+    scale = ", ".join(OCCUPANCY_LABELS.get(status, str(status)) for status in result.forecast["levels"])
     print(f"\n  On {metrics['evaluated_points']:,} points with an observed status. The scale is the statuses found, one step "
           f"apart:\n  {scale}.\n  \"Right\": the median rounded to a status is the observed one. \"No change\" repeats the "
           f"last observed status\n  (its 80% range would have zero width): occupancy changes rarely, so it is hard to beat.")
-    if result.skipped:
-        print(f"warning: {result.skipped} forecast(s) with NaN or infinite values were dropped.")
     if path.resolve().parent == REPLAYS_DIR.resolve():
         print_next_step("rebuild the demo so that it includes the forecast", ".\\build_demo.bat   (at the repo root)",
                         '(or, without a rebuild, copy the file into the replays folder next to "STM DT Demo.exe" in an unzipped demo)')

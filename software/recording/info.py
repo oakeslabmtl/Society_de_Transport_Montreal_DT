@@ -1,28 +1,14 @@
 from collections import Counter
 from recording.paths import display_path
-from recording.store import RecordingStore, sort_routes
+from recording.store import OCCUPANCY_LABELS, RecordingStore, sort_routes
 from recording.timeline import (Window, best_windows, contiguous_spans, find_gaps, format_clock, format_duration,
                                 format_span, max_gap)
-
-# GTFS-realtime VehiclePosition.OccupancyStatus
-OCCUPANCY_LABELS = {
-    0: "EMPTY",
-    1: "MANY_SEATS_AVAILABLE",
-    2: "FEW_SEATS_AVAILABLE",
-    3: "STANDING_ROOM_ONLY",
-    4: "CRUSHED_STANDING_ROOM_ONLY",
-    5: "FULL",
-    6: "NOT_ACCEPTING_PASSENGERS",
-    7: "NO_DATA_AVAILABLE",
-    8: "NOT_BOARDABLE",
-}
 
 
 def describe(store:RecordingStore, minutes:float=60, top:int=3) -> tuple[list[str], Window | None]:
     """Human summary of a recording, and its best gap-free window of `minutes` (None if there is none)."""
     meta = store.meta
-    tz = meta.get("timezone", "America/Montreal")
-    interval = meta.get("poll_interval_s", 15.0)
+    tz, interval = meta["timezone"], meta["poll_interval_s"]
     polls = store.polls()
     ok = [poll for poll in polls if poll.status == "ok"]
     failed = [poll for poll in polls if poll.status != "ok"]

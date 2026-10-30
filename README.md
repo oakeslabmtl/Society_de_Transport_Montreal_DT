@@ -192,10 +192,27 @@ Copy an exported `.json` into the `replays` folder next to `STM DT Demo.exe` in 
   - The range is honest now: it holds 89% of the outcomes (86% 10 minutes ahead, against 72% raw), and 59% of the outcomes where the status changed (29% raw). The price is a range about 1.7 times wider.
 
   The chart's footer shows the model, how often it is right and whether it beats "no change"; hover the footer for the other scores and what the calibration learned.
+- **Optional: the location model.** `forecast --model location` stores another forecast instead of Timestral's: a logistic regression that also knows where each bus is. It uses how long the bus has kept its status, how far along its trip it is (from `direction_id` and `current_stop_sequence`), whether a metro station is just ahead, and how the bus ahead on its line changed after this stop (from `stop_id` and the stop lists of `route-stops`). It learns from the replay itself, walk-forward like the calibration, and shows "no change" until a forecast point has 2,000 past outcomes from 20 buses (200 at its horizon and 200 at the bus's status): from about minute 7 to 14 on the bundled hour, the chart says "model still learning". It needs numpy only, so the main environment is enough. From the repository root:
+  ```
+  python software\recording forecast visualization\replays\<file>.json --model location
+  ```
+  It takes about 20 seconds for the bundled hour and about a minute for 8.7 hours on a laptop CPU (it is refitted every minute on all past outcomes). Run `forecast` without `--model` to go back to Timestral. Results, with the 95% interval of the difference with "no change" (2,000 resamplings of whole buses):
+
+  | | bundled hour (Wednesday 2026, 6 lines) | Saturday 1 March 2025 (8.7 h, lines 45, 121, 140) |
+  |---|---|---|
+  | right: location model | 73.7% | 80.9% |
+  | right: Timestral + calibration | 74.0% | 79.5% |
+  | right: "no change" | 74.3% | 79.8% |
+  | location model − "no change" | −0.6 points [−1.7, +0.3] | +1.1 points [+0.1, +1.9] |
+  | same, 10 min ahead | −0.3 points [−2.7, +1.9] | +4.7 points [+2.1, +7.1] |
+  | average error (steps): model / "no change" | 0.289 / 0.290 | 0.199 / 0.216 |
+  | 80% range holds | 85% | 88% |
+
+  It beats "no change" (and Timestral) on the long Saturday, most clearly 10 minutes ahead, but not on the bundled hour, so the bundled replay keeps Timestral + calibration. Two days are not enough to know when it wins (see below). The Saturday replay is not bundled: an export of `datasets\20250301-buses.csv` has no `direction_id` or `stop_id`, so for this test they were added from the 2025 GTFS. Without them, the model can only use each bus's status history.
 
 ### What we tried to make the forecast better (for students)
 
-The question: could correlations between buses, or where a bus is, predict its occupancy better? Everything was tested on the bundled hour, walk-forward (each forecast only learns from the past), with a decision rule fixed before looking at the results: a method wins only if it is right more often than "no change", with a 95% interval above 0 (2,000 resamplings of whole buses).
+The question: could correlations between buses, or where a bus is, predict its occupancy better? Everything was tested on the bundled hour (the location model also on a Saturday), walk-forward (each forecast only learns from the past), with a decision rule fixed before looking at the results: a method wins only if it is right more often than "no change", with a 95% interval above 0 (2,000 resamplings of whole buses).
 
 - **The data does hold real patterns.**
   - The bus ahead: when the previous bus of the same line got fuller after passing this bus's stop, this bus got fuller 10 minutes later in 46% of cases, and emptier in only 7% (correlation +0.33).
@@ -203,11 +220,12 @@ The question: could correlations between buses, or where a bus is, predict its o
   - Metro stations on the way: more changes (+12 points), but not in one direction.
 - **But correlation is not forecasting.** Used as predictors, they did not win:
   - Adding the bus ahead's change to the calibrated forecast: 10 minutes ahead, −1.7 points against "no change", worse than the calibrated forecast alone (−0.3).
-  - A location-aware logistic regression (current status, trip progress, stations ahead, bus ahead, Timestral's output): right 73.4%, −0.9 points against "no change". It did predict better probabilities and a better range, but what it learned about trip position did not match the data.
+  - A location-aware logistic regression (current status, trip progress, stations ahead, bus ahead, Timestral's output): right 73.4%, −0.9 points against "no change". It did predict better probabilities and a better range, but what it learned about trip position did not match the data. (The `--model location` version below drops Timestral's output and shows "no change" instead of Timestral while it learns: 73.7%, −0.6 points.)
   - Giving Timestral a longer history, or the other buses' occupancy as extra inputs, did not help either (previous study).
 - **What did help is calibration** (above): it fixes Timestral's own weaknesses, overconfident changes and a too-narrow range, using only its past results.
+- **A second day changed the picture for the location-aware model.** The same logistic regression, without Timestral's output (which it hardly used on the bundled hour), was then tested, with the decision rule fixed in advance, on a Saturday 2025 recording of 8.7 hours. There it beats "no change": +1.1 points [+0.1, +1.9], and +4.7 points [+2.1, +7.1] 10 minutes ahead. On the bundled hour it still does not (−0.6 [−1.7, +0.3]). It is now available as `forecast --model location` (above). Caveats: its features and penalty were chosen on that same Saturday in an earlier study, so the Saturday result is promising, not proven. The two recordings differ in day type, year, lines and buses, so which of these makes the difference cannot be told. A model trained on the Saturday did worse on the Wednesday. In an earlier variant, training only on the last hour of the Saturday did as well as training on all of it, so longer single days did not help. Whether earlier days would help is untested: this version only learns from the replay it forecasts.
 - **Limits.** One rush hour of one Wednesday, 6 lines. The intervals are optimistic: they resample buses without refitting the walk-forward models. Some buses report "many seats available" for a whole hour (probably a stuck sensor), which flatters "no change". Trip ends could only be guessed: the 2025 timetable in `datasets\` matches none of the 2026 trips.
-- **Next steps** need more data: record several weekday hours (morning and evening peaks) with `record`, then train on some days and test on others, and use a current STM timetable for trip ends.
+- **Next steps** need more data: record several weekday hours (morning and evening peaks) with `record`, then test the location model on each. Training it on some days and testing on others would need a new option (it cannot learn from other replays yet). Also use a current STM timetable for trip ends.
 
 ### Lines and their stops
 

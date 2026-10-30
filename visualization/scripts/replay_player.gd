@@ -150,9 +150,9 @@ func load_replay(path: String) -> bool:
 		_times.append(pair[0] - first_t)
 		_frames.append(pair[1])
 	duration = _times[_times.size() - 1]
-	start_time = _to_float(root.get("start_time"), 0.0) + first_t
-	utc_offset_seconds = int(_to_float(root.get("utc_offset_seconds"), 0.0))
-	poll_interval = _to_float(root.get("poll_interval"), 15.0)
+	start_time = to_float(root.get("start_time"), 0.0) + first_t
+	utc_offset_seconds = int(to_float(root.get("utc_offset_seconds"), 0.0))
+	poll_interval = to_float(root.get("poll_interval"), 15.0)
 	routes = _read_routes(root.get("routes"))
 	root.erase("frames")
 	meta = root
@@ -316,7 +316,8 @@ func _read_header(path: String) -> Dictionary:
 static func _same_path(a: String, b: String) -> bool:
 	return a.simplify_path().replace("\\", "/").to_lower() == b.simplify_path().replace("\\", "/").to_lower()
 
-static func _to_float(value, default_value: float) -> float:
+## A JSON number or a numeric string as a float, else default_value
+static func to_float(value, default_value: float) -> float:
 	if value is float or value is int:
 		return float(value)
 	if value is String and value.is_valid_float():

@@ -12,7 +12,7 @@ import unittest
 from fractions import Fraction
 from unittest import mock
 import numpy as np
-from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, make_recording
+from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, make_recording, replay_dict, run_cli
 from recording import RecordingError, forecast
 from recording.cli import build_parser, main
 from recording.forecast import (QUANTILES, CalibrationSettings, ForecastSettings, build_grid, compute_forecast,
@@ -38,12 +38,7 @@ def make_replay(frames:list[dict], step:float=15.0, times:list[float]=None) -> d
                 bus["vehicle.occupancy_status"] = status
             data.append(bus)
         replay_frames.append({"t": t, "data": data})
-    end = replay_frames[-1]["t"]
-    return {"format": "stm-dt-replay", "version": 1, "name": "Test · forecast", "created_at": "2025-03-01T20:00:00Z",
-            "source": {"type": "csv-import", "detail": "tests"}, "timezone": "America/Montreal",
-            "utc_offset_seconds": -18000, "start_time": T0, "end_time": T0 + end, "duration": end, "poll_interval": step,
-            "routes": [24], "vehicle_count": len({vehicle for statuses in frames for vehicle in statuses}),
-            "frames": replay_frames}
+    return replay_dict(replay_frames, step, "Test · forecast", [24], len({vehicle for statuses in frames for vehicle in statuses}))
 
 
 def series_replay(series:dict[str, list], step:float=15.0, skip_slots:tuple=()) -> dict:
@@ -562,11 +557,8 @@ class ForecastCommandTest(TempDirTestCase):
                      self.path)
 
     def forecast(self, *args) -> tuple[int, str, str]:
-        with mock.patch("recording.forecast.load_forecaster", return_value=FakeForecaster()) as load, \
-                contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
-            code = main(["forecast", str(self.path), *args])
-        self.load = load
-        return code, stdout.getvalue(), stderr.getvalue()
+        with mock.patch("recording.forecast.load_forecaster", return_value=FakeForecaster()) as self.load:
+            return run_cli("forecast", str(self.path), *args)
 
     def test_forecast_is_stored_after_the_frames_and_replaced_on_a_new_run(self):
         code, stdout, _ = self.forecast()
@@ -661,10 +653,6 @@ class ForecastCommandTest(TempDirTestCase):
         self.assertRegex(stdout, r"calibrated +raw Fake-1M +\"no change\"")
         self.assertRegex(stdout, r"right( +\d+\.\d%){3}\n")
         self.assertRegex(stdout, r"80% range holds( +\d+%){3}\n")
-
-    def test_no_calibration_option(self):
-        self.assertFalse(build_parser().parse_args(["forecast", "x.json"]).no_calibration)
-        self.assertTrue(build_parser().parse_args(["forecast", "x.json", "--no-calibration"]).no_calibration)
 
     def test_cli_defaults_are_those_of_the_module(self):
         args = build_parser().parse_args(["forecast", "x.json"])

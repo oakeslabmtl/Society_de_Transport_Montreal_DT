@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from recording import RecordingError
-from recording.store import KEY_TYPES, dedupe_by_vehicle, sort_routes
+from recording.store import DEFAULT_POLL_INTERVAL, KEY_TYPES, dedupe_by_vehicle, sort_routes
 
 logger = logging.getLogger("CsvImport")
 
@@ -34,7 +34,7 @@ class CsvPolls:
     routes: list[str] = field(default_factory=list)
 
 
-def read_csv_polls(csv_path:Path, cluster_gap:float=5.0, interval:float=15.0) -> CsvPolls:
+def read_csv_polls(csv_path:Path, cluster_gap:float=5.0, interval:float=DEFAULT_POLL_INTERVAL) -> CsvPolls:
     """Reads a MongoDB CSV export of the live messages and regroups its rows into polls.
 
     - `_id` column (MongoDB ObjectId): its first 8 hex digits are the insert time. Rows inserted less than

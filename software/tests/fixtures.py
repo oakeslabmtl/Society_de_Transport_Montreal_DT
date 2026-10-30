@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -9,6 +11,8 @@ SOFTWARE_DIR = Path(__file__).resolve().parents[1]
 if str(SOFTWARE_DIR) not in sys.path:
     sys.path.insert(0, str(SOFTWARE_DIR))
 
+from recording.cli import main
+from recording.replay import FORMAT as REPLAY_FORMAT, VERSION as REPLAY_VERSION
 from recording.store import RecordingStore
 
 T0 = 1740859200  # Sat 2025-03-01 15:00:00 America/Montreal (UTC-5)
@@ -34,6 +38,23 @@ def entity(vehicle_id:str, route_id:str, timestamp:int, latitude:float=45.5, lon
     }
     data.update(fields)
     return data
+
+
+def replay_dict(frames:list[dict], step:float, name:str, routes:list, vehicles:int) -> dict:
+    """A replay (format of visualization/replays/README.md) of these frames, from T0."""
+    end = frames[-1]["t"]
+    return {"format": REPLAY_FORMAT, "version": REPLAY_VERSION, "name": name, "created_at": "2025-03-01T20:00:00Z",
+            "source": {"type": "csv-import", "detail": "tests"}, "timezone": "America/Montreal",
+            "utc_offset_seconds": -18000, "start_time": T0, "end_time": T0 + end, "duration": end, "poll_interval": step,
+            "routes": routes, "vehicle_count": vehicles, "frames": frames}
+
+
+def run_cli(*argv:str) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr) of the command line `argv`."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = main(list(argv))
+    return code, out.getvalue(), err.getvalue()
 
 
 def typed(value) -> str:

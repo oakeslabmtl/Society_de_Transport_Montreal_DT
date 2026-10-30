@@ -24,7 +24,7 @@ const INK_SECONDARY := Color("#c3c2b7")
 const INK_MUTED := Color("#898781")
 const GRID_COLOR := Color("#2c2c2a")
 const AXIS_COLOR := Color("#383835")
-const SERIES_COLOR := Color("#3987e5") # Observed and forecast: same bus, same color (solid vs dashed); also its outline
+const SERIES_COLOR := Occupancy.SELECTED_COLOR # Observed and forecast: same bus, same color (solid vs dashed)
 const BAND_ALPHA := 0.22
 const TOOLTIP_COLOR := Color("#1a1a19")
 const CHIP_BORDER := Color("#5c5b56")
@@ -42,7 +42,6 @@ const PLOT_TOP := 14.0 # Room above the plot for the "now" label
 const PLOT_BOTTOM := 16.0 # Room below the plot for the time labels
 const LEVEL_PAD := 6.0 # Keeps the top and bottom rows (lines and hover dots) inside the clipped plot
 const SNAP_PIXELS := 12.0 # Hover snaps to the nearest observation or forecast point within this distance
-const TIME_EPSILON := 0.01 # Seconds: frame and origin times may differ by rounding
 
 var data = null # OccupancyData (occupancy_data.gd)
 var vehicle_id := "" # Bus shown in the chart, "" when the chart is hidden
@@ -71,7 +70,9 @@ var _history_points := 0
 var _forecast_points := 0
 var _message := ""
 var _future_note := "" # Shown in the empty plot area after now when there is nothing to draw there
-var _calibration_note := "" # Shown at the top right of the plot while the shown forecast is partly uncalibrated
+var _learning_note := "" # Shown at the top right of the plot while the shown forecast is partly uncalibrated or untrained
+var _metrics_tooltip := "" # _metrics_text() of the forecast loaded at data.statuses_version _metrics_version
+var _metrics_version := -1
 var _label_column := 0.0
 var _hidden := {} # route -> true: lines whose buses and stops are hidden
 
@@ -253,7 +254,7 @@ func chart_stats() -> Dictionary:
 		rows.append(Occupancy.label(status))
 	return {"visible": _chart.visible, "vehicle": vehicle_id, "history_points": _history_points if _chart.visible else 0,
 		"forecast_points": _forecast_points if _chart.visible else 0, "message": _message if _chart.visible else "",
-		"rows": rows, "legend": legend_labels(), "calibration_note": _calibration_note if _chart.visible else "",
+		"rows": rows, "legend": legend_labels(), "learning_note": _learning_note if _chart.visible else "",
 		"footer_tooltip": _footer.tooltip_text if _chart.visible else ""}
 
 ## Labels of the legend's occupancy entries, in order (self-test)
@@ -731,7 +732,7 @@ func _rebuild() -> void:
 	var times: PackedFloat64Array = data.history_times(vehicle_id)
 	var statuses: PackedInt32Array = data.history_statuses(vehicle_id)
 	var first := maxi(times.bsearch(_x_start) - 1, 0)
-	var after_now := times.bsearch(_now + TIME_EPSILON, false)
+	var after_now := times.bsearch(_now + Occupancy.TIME_EPSILON, false)
 	_observed_times = times.slice(first, after_now)
 	_observed_statuses = statuses.slice(first, after_now)
 	_history_points = 0
@@ -764,14 +765,14 @@ func _rebuild() -> void:
 		_fc_median.append_array(_forecast["median"])
 		_fc_hi.append_array(_forecast["hi"])
 		for t in _forecast["times"]:
-			if t >= _x_start and t <= _x_end + TIME_EPSILON:
+			if t >= _x_start and t <= _x_end + Occupancy.TIME_EPSILON:
 				_forecast_points += 1
 	# Nothing to draw after now: say why there, not only in the footer
 	_future_note = ""
 	if _fc_times.is_empty() and _actual_times.is_empty():
 		_future_note = "No forecast yet" if _is_replay and data.has_forecast and _too_little_history() else "No forecast"
-	# Early in a calibrated replay, some points are still the raw model output
-	_calibration_note = "calibration still learning" if _forecast != null and data.calibration_learning(_forecast["origin"]) else ""
+	# Early in a replay, some points are still the raw model output (calibration) or "no change" (location model)
+	_learning_note = data.learning_note(_forecast["origin"]) if _forecast != null else ""
 
 	_update_texts()
 	_update_hover()
@@ -791,7 +792,10 @@ func _update_texts() -> void:
 	_status_label.tooltip_text = status
 	_message = _footer_text()
 	_footer.text = _message
-	_footer.tooltip_text = _message if _forecast == null else _metrics_text()
+	if _forecast != null and _metrics_version != data.statuses_version: # The same for every bus and time: once per load
+		_metrics_tooltip = _metrics_text()
+		_metrics_version = data.statuses_version
+	_footer.tooltip_text = _message if _forecast == null else _metrics_tooltip
 
 func _footer_text() -> String:
 	if not _is_replay:
@@ -804,12 +808,12 @@ func _footer_text() -> String:
 		var text: String = data.model_name
 		var accuracy = data.metrics.get("accuracy")
 		var baseline = data.metrics.get("accuracy_last_value")
-		if _is_number(accuracy) and _is_number(baseline):
+		if Occupancy.is_number(accuracy) and Occupancy.is_number(baseline):
 			# Computed from the metrics, never assumed: the model may well not beat "no change"
 			var verdict := "better than" if float(accuracy) > float(baseline) + 0.005 else "no better than"
 			var decimals := _decimals_apart(accuracy, baseline)
 			text += " · right %s, %s “no change” (%s)" % [_percent(accuracy, decimals), verdict, _percent(baseline, decimals)]
-		elif _is_number(accuracy):
+		elif Occupancy.is_number(accuracy):
 			text += " · right %s of the time" % _percent(accuracy)
 		return text
 	if _too_little_history():
@@ -821,8 +825,7 @@ func _footer_text() -> String:
 func _metrics_text() -> String:
 	var lines := PackedStringArray()
 	var calibrated: bool = not data.metrics_raw.is_empty()
-	# Without the raw scores, the scores shown are those of model_name as stored (calibrated or not)
-	var model: String = data.model_name.trim_suffix(" + calibration") if calibrated else data.model_name
+	var model: String = data.base_model_name
 	lines.append("Forecast precomputed with %s%s; scores over the whole replay." % [model, ", then calibrated" if calibrated else ""])
 	lines.append("“Right”: the median rounded to a status is the observed status. “No change” repeats the last observed status.")
 	if calibrated:
@@ -830,26 +833,58 @@ func _metrics_text() -> String:
 		var raw_coverage = data.metrics_raw.get("coverage")
 		var accuracy = data.metrics.get("accuracy")
 		var coverage = data.metrics.get("coverage")
-		if _is_number(raw_accuracy) and _is_number(raw_coverage) and _is_number(accuracy) and _is_number(coverage):
+		if Occupancy.is_number(raw_accuracy) and Occupancy.is_number(raw_coverage) and Occupancy.is_number(accuracy) and Occupancy.is_number(coverage):
 			var decimals := _decimals_apart(raw_accuracy, accuracy)
 			lines.append("Raw %s: right %s, its %d%% range held %s. Calibrated: right %s, the range holds %s." % [model,
 				_percent(raw_accuracy, decimals), data.range_percent(), _percent(raw_coverage), _percent(accuracy, decimals), _percent(coverage)])
 	else:
 		var coverage = data.metrics.get("coverage")
-		if _is_number(coverage):
+		if Occupancy.is_number(coverage):
 			lines.append("The %d%% range holds %s of the observed statuses." % [data.range_percent(), _percent(coverage)])
 	var mae = data.metrics.get("mae")
 	var mae_baseline = data.metrics.get("mae_last_value")
-	if _is_number(mae) and _is_number(mae_baseline):
+	if Occupancy.is_number(mae) and Occupancy.is_number(mae_baseline):
 		var digits := "%.3f" if "%.2f" % mae == "%.2f" % mae_baseline else "%.2f" # 0.295 vs 0.290, not 0.29 vs 0.29
 		lines.append(("Average error: " + digits + " steps between statuses (“no change”: " + digits + ").") % [mae, mae_baseline])
 	var at_horizon = data.metrics.get("accuracy_at_horizon")
 	var baseline_at_horizon = data.metrics.get("accuracy_last_value_at_horizon")
-	if _is_number(at_horizon) and _is_number(baseline_at_horizon):
+	if Occupancy.is_number(at_horizon) and Occupancy.is_number(baseline_at_horizon):
 		var decimals := _decimals_apart(at_horizon, baseline_at_horizon)
 		lines.append("%s ahead: right %s (“no change”: %s)." % [_duration_text(data.horizon), _percent(at_horizon, decimals), _percent(baseline_at_horizon, decimals)])
 	lines.append_array(_calibration_lines())
+	lines.append_array(_training_lines())
 	return "\n".join(lines)
+
+## How the location model learned, for students: it only looks back, what it uses, and when it starts
+func _training_lines() -> PackedStringArray:
+	var lines := PackedStringArray()
+	var training: Dictionary = data.training
+	if training.is_empty():
+		return lines
+	if data.forecast_levels.size() < 2:
+		lines.append("The replay has a single status: there is no change to learn, every point shows no change.")
+		return lines
+	var needs := "%s past outcomes from %d buses, %d at its horizon and %d at the bus's status" % [
+		_thousands(int(training["min_points"])), int(training["min_buses"]), int(training["min_points_per_point"]),
+		int(training["min_points_per_status"])]
+	var final = training.get("final")
+	if not final is Dictionary:
+		lines.append("It never had enough past outcomes (a point needs %s): every point shows no change." % needs)
+		return lines
+	lines.append("It is a logistic regression that only looks back: before each forecast it relearns from the earlier forecast points whose outcome is known (by the end, %s from %d buses)." % [_thousands(int(final["examples"])), int(final["buses"])])
+	var uses := "It uses each bus's status and how long it has held it"
+	if float(training["position_known"]) > 0.0:
+		uses += ", where it is on its trip (known for %s of the forecasts)" % _percent(training["position_known"])
+	if float(training["stop_known"]) > 0.0:
+		uses += ", metro stations ahead and the bus ahead on its line (stop known for %s)" % _percent(training["stop_known"])
+	lines.append(uses + ".")
+	var first := INF
+	for value in training["first_t"]:
+		if value != null:
+			first = minf(first, float(value))
+	var start := ", from minute %d" % roundi(first / 60.0) if first < INF else ""
+	lines.append("A point shows no change until the model has %s: the model made %s of the points%s." % [needs, _percent(training["model_share"]), start])
+	return lines
 
 ## What the calibration learned, for students: it only looks back, how much it trusts the model's predicted changes
 func _calibration_lines() -> PackedStringArray:
@@ -877,7 +912,7 @@ func _calibration_lines() -> PackedStringArray:
 		# Why the weight ended where it did: read from the weight, not assumed from the bundled hour
 		var reason := "most buses keep their status" if final_weight < 0.5 else "its predicted changes mostly happen"
 		lines.append("It trusts %s's predicted changes up to %s (%s ahead, %d min into the replay); by the end, %s at %s ahead: %s." % [
-			data.model_name.trim_suffix(" + calibration"), _percent(best), _duration_text(data.point_every * (best_point + 1)),
+			data.base_model_name, _percent(best), _duration_text(data.point_every * (best_point + 1)),
 			roundi(best_time / 60.0), _percent(final_weight), _duration_text(data.horizon), reason])
 	lines.append("Its range is widened until each end held 90% of past outcomes, so that it holds at least 8 outcomes in 10.")
 	return lines
@@ -899,9 +934,6 @@ static func _thousands(value: int) -> String:
 ## 1 decimal when two shares round to the same whole percent (74.0% vs 74.3%, not 74% vs 74%), else 0
 static func _decimals_apart(a, b) -> int:
 	return 1 if _percent(a) == _percent(b) else 0
-
-static func _is_number(value) -> bool:
-	return value is float or value is int
 
 ## True when the bus has been observed for less than the forecast's minimum history
 func _too_little_history() -> bool:
@@ -936,7 +968,7 @@ func _update_hover() -> void:
 	var first_line := _clock(_hover_time, true)
 	var observed := _observed_status_at(_hover_time)
 	if observed != -2:
-		first_line += " · %s: %s" % ["Observed" if _hover_time <= _now + TIME_EPSILON else "Actual", Occupancy.label(observed)]
+		first_line += " · %s: %s" % ["Observed" if _hover_time <= _now + Occupancy.TIME_EPSILON else "Actual", Occupancy.label(observed)]
 	var second_line := ""
 	var forecast := _forecast_at_time(_hover_time)
 	if not forecast.is_empty():
@@ -971,17 +1003,17 @@ func _update_hover() -> void:
 ## Observed status at a time (step function), Occupancy.NO_DATA for a "no data" observation, -2 when
 ## there is nothing to show (no observation close enough, or after now without "Show actual")
 func _observed_status_at(unix_time: float) -> int:
-	var after_now := unix_time > _now + TIME_EPSILON
+	var after_now := unix_time > _now + Occupancy.TIME_EPSILON
 	var times: PackedFloat64Array = _actual_times if after_now else _observed_times
 	var statuses: PackedInt32Array = _actual_statuses if after_now else _observed_statuses
-	var index := times.bsearch(unix_time + TIME_EPSILON, false) - 1
+	var index := times.bsearch(unix_time + Occupancy.TIME_EPSILON, false) - 1
 	if index < 0 or unix_time - times[index] > GAP_SECONDS:
 		return -2
 	return statuses[index]
 
 ## Forecast median and range at a time (linear between the anchors), as ranks, {} outside the forecast
 func _forecast_at_time(unix_time: float) -> Dictionary:
-	if _fc_times.is_empty() or unix_time < _fc_times[0] - TIME_EPSILON or unix_time > _fc_times[_fc_times.size() - 1] + TIME_EPSILON:
+	if _fc_times.is_empty() or unix_time < _fc_times[0] - Occupancy.TIME_EPSILON or unix_time > _fc_times[_fc_times.size() - 1] + Occupancy.TIME_EPSILON:
 		return {}
 	var index := clampi(_fc_times.bsearch(unix_time, false) - 1, 0, _fc_times.size() - 1)
 	if index == _fc_times.size() - 1:
@@ -1019,7 +1051,7 @@ func _draw_axes() -> void:
 
 	# Ticks every 5 minutes of local time
 	var tick := ceilf((_x_start + _utc_offset) / TICK_SECONDS) * TICK_SECONDS - _utc_offset
-	while tick <= _x_end + TIME_EPSILON:
+	while tick <= _x_end + Occupancy.TIME_EPSILON:
 		var x := roundf(rect.position.x + _x_of(tick)) + 0.5
 		_plot.draw_line(Vector2(x, rect.end.y), Vector2(x, rect.end.y + 3.0), AXIS_COLOR, 1.0)
 		var text := _clock(tick)
@@ -1074,9 +1106,9 @@ func _draw_series() -> void:
 		if width > 40.0:
 			var baseline := _area.size.y * 0.5 + (font.get_ascent(AXIS_FONT_SIZE) - font.get_descent(AXIS_FONT_SIZE)) * 0.5
 			_area.draw_string(font, Vector2(x0, baseline), _future_note, HORIZONTAL_ALIGNMENT_CENTER, width, AXIS_FONT_SIZE, INK_SECONDARY)
-	if _calibration_note != "":
+	if _learning_note != "":
 		var font := _area.get_theme_font("font", "Label")
-		_area.draw_string(font, Vector2(0, font.get_ascent(AXIS_FONT_SIZE) + 2.0), _calibration_note, HORIZONTAL_ALIGNMENT_RIGHT,
+		_area.draw_string(font, Vector2(0, font.get_ascent(AXIS_FONT_SIZE) + 2.0), _learning_note, HORIZONTAL_ALIGNMENT_RIGHT,
 			_area.size.x - 4.0, AXIS_FONT_SIZE, INK_MUTED)
 
 	if _hover_time >= 0.0:
@@ -1084,7 +1116,7 @@ func _draw_series() -> void:
 		_area.draw_line(Vector2(x, 0), Vector2(x, _area.size.y), Color(INK_SECONDARY, 0.6), 1.0)
 		var observed_row := _row_of_status(_observed_status_at(_hover_time))
 		if observed_row >= 0:
-			_draw_dot(Vector2(x, _y_of(observed_row)), SERIES_COLOR if _hover_time <= _now + TIME_EPSILON else INK_SECONDARY)
+			_draw_dot(Vector2(x, _y_of(observed_row)), SERIES_COLOR if _hover_time <= _now + Occupancy.TIME_EPSILON else INK_SECONDARY)
 		var forecast := _forecast_at_time(_hover_time)
 		if not forecast.is_empty():
 			_draw_dot(Vector2(x, _y_of(_row_of_rank(forecast["median"]))), SERIES_COLOR)

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 import requests
 from recording import RecordingError
-from recording.store import RecordingStore, dedupe_by_vehicle
+from recording.store import RecordingStore, dedupe_by_vehicle, vehicle_key
 
 logger = logging.getLogger("Recorder")
 
@@ -112,7 +112,7 @@ def record(store:RecordingStore, fetch:Fetcher, interval:float, minutes:float=No
                     store.add_poll(poll_time, entities, feed_timestamp)
                     poll.vehicle_count = len(entities)
                     poll.route_counts = Counter(str(e.get("vehicle.trip.route_id")) for e in entities)
-                    result.vehicles.update(str(e.get("vehicle.vehicle.id", e.get("id"))) for e in entities)
+                    result.vehicles.update(vehicle_key(e) for e in entities)
                 failed_saves = 0
             except sqlite3.Error as error:
                 # e.g. the file stayed locked by another program, or the disk is full: this poll is lost, not the others

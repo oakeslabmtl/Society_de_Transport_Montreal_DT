@@ -7,6 +7,19 @@ from recording import RecordingError
 
 SCHEMA_VERSION = "1"
 TIMEZONE = "America/Montreal"
+DEFAULT_POLL_INTERVAL = 15.0    # s; same as communication.protocol.EXECUTION_INTERVAL (not imported: it needs STM_API_KEY)
+# GTFS-realtime VehiclePosition.OccupancyStatus
+OCCUPANCY_LABELS = {
+    0: "EMPTY",
+    1: "MANY_SEATS_AVAILABLE",
+    2: "FEW_SEATS_AVAILABLE",
+    3: "STANDING_ROOM_ONLY",
+    4: "CRUSHED_STANDING_ROOM_ONLY",
+    5: "FULL",
+    6: "NOT_ACCEPTING_PASSENGERS",
+    7: "NO_DATA_AVAILABLE",
+    8: "NOT_BOARDABLE",
+}
 # How long a connection waits for another one to release the file (e.g. a recording and an `export` at the same time)
 LOCK_TIMEOUT_S = 60.0
 # Polls read per query: each query holds a read lock that blocks the recorder's commits, so keep them short
@@ -192,11 +205,12 @@ class RecordingStore:
 
     @property
     def meta(self) -> dict:
+        """The recording's metadata, with the default timezone and poll interval when they are missing."""
         meta = {row["key"]: row["value"] for row in self.connection.execute("SELECT key, value FROM meta")}
         if "route_ids" in meta:
             meta["route_ids"] = json.loads(meta["route_ids"])
-        if "poll_interval_s" in meta:
-            meta["poll_interval_s"] = float(meta["poll_interval_s"])
+        meta.setdefault("timezone", TIMEZONE)
+        meta["poll_interval_s"] = float(meta.get("poll_interval_s", DEFAULT_POLL_INTERVAL))
         return meta
 
 

@@ -22,27 +22,26 @@ from typing import Callable, Protocol
 from recording import NothingToForecast, RecordingError
 from recording.paths import display_path, repo_relative
 from recording.replay import FORMAT as REPLAY_FORMAT, VERSION as REPLAY_VERSION
-from recording.store import utc_now_iso
+from recording.store import DEFAULT_POLL_INTERVAL, OCCUPANCY_LABELS, utc_now_iso
 
 FORMAT = "stm-dt-occupancy-forecast"
 VERSION = 2                         # 2: values are ranks of the statuses in "levels" (1 stored the status values)
 TARGET = "vehicle.occupancy_status"
 QUANTILES = (0.1, 0.5, 0.9)         # 80% range around the median
+LOW, MEDIAN, HIGH = 0, QUANTILES.index(0.5), len(QUANTILES) - 1     # rows of a stored forecast's "q"
 MAX_LEVEL = 5                       # FULL
 MIN_CONTEXT_VALUES = 4              # known levels a bus needs in its history to be forecast
 MAX_CONTEXT = 32768                 # most recent time steps given to the model (Timestral's trained context length)
 MAX_BATCH = 512                     # series per model call
-DEFAULT_STEP = 15.0                 # replay poll_interval when the file has none
 DEFAULT_POINT_EVERY = 30.0          # seconds between two stored forecast points
 
 DEFAULT_MODEL = "28M"
 MODEL_REPO = "mistralai/Timestral-{size}"
 MODEL_SIZES = {"5M": "21 MB", "28M": "111 MB", "123M": "490 MB", "209M": "837 MB"}   # download size of the weights
 
-# GTFS-realtime VehiclePosition.OccupancyStatus values that are a level. 6-8 (not accepting passengers, no data,
-# not boardable), a missing value and anything else are "no data".
-LEVELS = {"EMPTY": 0, "MANY_SEATS_AVAILABLE": 1, "FEW_SEATS_AVAILABLE": 2, "STANDING_ROOM_ONLY": 3,
-          "CRUSHED_STANDING_ROOM_ONLY": 4, "FULL": 5}
+# The OccupancyStatus values that are a level, by name. 6-8 (not accepting passengers, no data, not boardable), a
+# missing value and anything else are "no data".
+LEVELS = {name: value for value, name in OCCUPANCY_LABELS.items() if value <= MAX_LEVEL}
 
 INSTALL_STEPS = """\
 Install them in a separate environment so the main one stays small (PyTorch alone is a few hundred MB).
@@ -103,6 +102,10 @@ class OccupancyGrid:
     @property
     def slots(self) -> int:
         return len(self.times)
+
+    @property
+    def top_rank(self) -> int:
+        return max(len(self.statuses) - 1, 0)
 
 
 @dataclass
@@ -167,9 +170,11 @@ class Calibrator:
 
     def __init__(self, points:int, top_rank:int, settings:CalibrationSettings):
         self.points, self.top, self.settings = points, top_rank, settings
-        # Per horizon, chunks of past examples: target slot, vehicle number, rank at the origin, raw median, low and
-        # high, and the observed rank at the target (read when added: the target-slot filter of fit() keeps it unseen)
-        self._chunks = [[] for _ in range(points)]
+        # Per horizon, past examples as rows: target slot, vehicle number, rank at the origin, raw median, low and high,
+        # and the observed rank at the target (read when added: fit() only uses rows whose target slot has passed).
+        # Rows come in forecast time order, so their target slots never decrease. New rows wait in _new until fit().
+        self._examples = [np.empty((0, 7)) for _ in range(points)]
+        self._new: list[list[tuple]] = [[] for _ in range(points)]
         self._vehicle_numbers: dict[str, int] = {}
         self.params: list[dict | None] = [None] * points
 
@@ -177,20 +182,23 @@ class Calibrator:
         """Records a raw forecast (Q x points, low/median/high) and the observed ranks of its points (NaN: unknown)."""
         number = self._vehicle_numbers.setdefault(vehicle, len(self._vehicle_numbers))
         for h in np.nonzero(np.isfinite(observed))[0]:
-            self._chunks[h].append((target_slots[h], number, rank, raw[1][h], raw[0][h], raw[2][h], observed[h]))
+            self._new[h].append((target_slots[h], number, rank, raw[MEDIAN][h], raw[LOW][h], raw[HIGH][h], observed[h]))
 
     def fit(self, origin_slot:int):
         """Fits every horizon on its examples whose target slot is <= origin_slot (self.params[h], None: raw)."""
         for h in range(self.points):
             self.params[h] = None
-            if not self.settings.enabled or not self._chunks[h]:
+            if not self.settings.enabled:
                 continue
-            target, vehicle, rank, median, low, high, observed = (np.array(column) for column in zip(*self._chunks[h]))
-            past = target <= origin_slot
-            n, buses = int(past.sum()), int(np.unique(vehicle[past]).size)
+            if self._new[h]:
+                self._examples[h] = np.concatenate([self._examples[h], np.array(self._new[h], dtype=np.float64)])
+                self._new[h] = []
+            examples = self._examples[h]
+            past = examples[:np.searchsorted(examples[:, 0], origin_slot, side="right")]
+            vehicle, rank, median, low, high, observed = past[:, 1:].T
+            n, buses = len(past), int(np.unique(vehicle).size)
             if n < self.settings.min_points or buses < self.settings.min_buses:
                 continue
-            rank, median, low, high, observed, vehicle = (a[past] for a in (rank, median, low, high, observed, vehicle))
             move, happened = median - rank, observed - rank
             sxx = float((move * move).sum())
             weight = float(np.clip((move * happened).sum() / sxx, 0.0, 1.0)) if sxx > 0 else 0.0
@@ -211,13 +219,17 @@ class Calibrator:
             if params is None:
                 continue
             low_offset, high_offset = params["offsets"][r]
-            median = round(float(np.clip(rank + params["w"] * (raw[1][h] - rank), 0, self.top)), 2)
+            median = self._clip(rank + params["w"] * (raw[MEDIAN][h] - rank))
             # Not sorted: low <= median <= high by construction (sorting would swap the median with a range end)
-            stored[0][h] = round(float(np.clip(min(raw[0][h] - low_offset, median), 0, self.top)), 2)
-            stored[1][h] = median
-            stored[2][h] = round(float(np.clip(max(raw[2][h] + high_offset, median), 0, self.top)), 2)
+            stored[LOW][h] = self._clip(min(raw[LOW][h] - low_offset, median))
+            stored[MEDIAN][h] = median
+            stored[HIGH][h] = self._clip(max(raw[HIGH][h] + high_offset, median))
             calibrated[h] = True
         return stored, calibrated
+
+    def _clip(self, value:float) -> float:
+        """value in [0, top rank], rounded to 2 decimals (plain floats: numpy is slow on scalars)."""
+        return round(float(min(max(value, 0.0), self.top)), 2)
 
 
 def conformal_offset(scores:np.ndarray, level:float=RANGE_TAIL) -> float:
@@ -281,25 +293,28 @@ def read_replay(path:Path) -> dict:
     return replay
 
 
-def build_grid(replay:dict) -> OccupancyGrid:
-    """slot = round((t - t0) / poll_interval). A vehicle missing from a frame, or a slot without a frame, is NaN.
-    When two frames fall on one slot, the later one replaces the earlier one. Levels are ranks among the statuses found."""
-    step = replay.get("poll_interval") or DEFAULT_STEP
-    if not isinstance(step, (int, float)) or step <= 0:
-        raise RecordingError(f"The replay's poll_interval must be a number of seconds greater than 0 (got {step!r}).")
+def frame_slots(replay:dict, step:float) -> list[tuple[int, dict]]:
+    """(grid slot, frame) for the replay's frames in time order, slot = round((t - t0) / step). When two frames fall
+    on one slot, the later one replaces the earlier one."""
     try:
         frames = sorted(replay["frames"], key=lambda frame: float(frame["t"]))
         t0 = float(frames[0]["t"])
-        slots = [int(round((float(frame["t"]) - t0) / step)) for frame in frames]
+        slotted = {int(round((float(frame["t"]) - t0) / step)): frame for frame in frames}
     except (KeyError, TypeError, ValueError) as error:
         raise RecordingError(f"The replay has a frame without a valid time `t` ({error!r}).") from error
+    return list(slotted.items())
 
-    times = np.full(slots[-1] + 1, np.nan)
+
+def build_grid(replay:dict) -> OccupancyGrid:
+    """The occupancy of every vehicle on the frame_slots() grid. A vehicle missing from a frame, or a slot without a
+    frame, is NaN. Levels are ranks among the statuses found."""
+    step = replay.get("poll_interval") or DEFAULT_POLL_INTERVAL
+    if not isinstance(step, (int, float)) or step <= 0:
+        raise RecordingError(f"The replay's poll_interval must be a number of seconds greater than 0 (got {step!r}).")
+    slotted = frame_slots(replay, step)
+    times = np.full(slotted[-1][0] + 1, np.nan)
     levels: dict[str, np.ndarray] = {}
-    for slot, frame in zip(slots, frames):
-        if not math.isnan(times[slot]):
-            for series in levels.values():
-                series[slot] = np.nan
+    for slot, frame in slotted:
         times[slot] = float(frame["t"])
         for entity in frame.get("data") or ():
             vehicle = vehicle_id(entity)
@@ -379,10 +394,8 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
     """Runs the model at every origin of the plan (all its buses in one batch), calibrates its output walk-forward
     (Calibrator) and scores the stored points, and the raw model output, against what was observed.
     on_progress(origins done, origins, origin t, buses) is called after each origin."""
-    grid, length = plan.grid, plan.prediction_length
-    top_rank = max(len(grid.statuses) - 1, 0)
+    grid, length, top_rank = plan.grid, plan.prediction_length, plan.grid.top_rank
     kept = np.arange(1, plan.points + 1) * plan.point_slots - 1          # model steps at origin + point_every * (k + 1)
-    median, low, high = QUANTILES.index(0.5), 0, len(QUANTILES) - 1
     calibrator = Calibrator(plan.points, top_rank, calibration)
     stored: dict[str, list] = {}
     columns = ("observed", "median", "low", "high", "last", "at_horizon")
@@ -437,9 +450,9 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
                 known = np.isfinite(observed)
                 for into, rows in ((scores, quantiles), (raw_scores, raw)):
                     into["observed"].append(observed[known])
-                    into["median"].append(rows[median][known])
-                    into["low"].append(rows[low][known])
-                    into["high"].append(rows[high][known])
+                    into["median"].append(rows[MEDIAN][known])
+                    into["low"].append(rows[LOW][known])
+                    into["high"].append(rows[HIGH][known])
                     into["last"].append(np.full(int(known.sum()), rank))
                     into["at_horizon"].append((np.arange(plan.points) == plan.points - 1)[known])
         if on_progress:
@@ -450,29 +463,40 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
     def scored(parts:dict) -> dict:
         return score(**{name: np.concatenate(values) if values else np.empty(0) for name, values in parts.items()})
 
+    details = {}
+    if calibrated_points:
+        forecasts = sum(len(entries) for entries in stored.values())
+        details = {"metrics_raw": scored(raw_scores),
+                   "calibration": calibration_info(calibrator, calibration, calibrated_points / (forecasts * plan.points),
+                                                   first_t, history_t, history_w)}
+    model_name = f"{forecaster.model_name} + calibration" if calibrated_points else forecaster.model_name
+    return forecast_result(plan, forecaster.model, model_name, scored(scores), details, stored, skipped)
+
+
+def forecast_result(plan:ForecastPlan, model:str, model_name:str, metrics:dict, details:dict, stored:dict[str, list],
+                    skipped:int=0) -> ForecastResult:
+    """The replay's "forecast" value (format: visualization/replays/README.md) and its counts. `details` holds the
+    model's own keys (e.g. metrics_raw and calibration), stored after the metrics; `stored` the forecasts by bus."""
     settings = plan.settings
-    forecasts = sum(len(entries) for entries in stored.values())
     forecast = {
         "format": FORMAT,
         "version": VERSION,
-        "model": forecaster.model,
-        "model_name": f"{forecaster.model_name} + calibration" if calibrated_points else forecaster.model_name,
+        "model": model,
+        "model_name": model_name,
         "created_at": utc_now_iso(),
         "target": TARGET,
-        "levels": list(grid.statuses),      # forecast value r (a rank) stands for status levels[r]
-        "step": grid.step,
+        "levels": list(plan.grid.statuses),     # forecast value r (a rank) stands for status levels[r]
+        "step": plan.grid.step,
         "point_every": settings.point_every,
         "horizon": settings.horizon,
         "origin_every": settings.origin_every,
         "min_history": settings.min_history,
         "quantiles": list(QUANTILES),
-        "metrics": scored(scores),
+        "metrics": metrics,
+        **details,
+        "vehicles": {vehicle: stored[vehicle] for vehicle in sorted(stored)},
     }
-    if calibrated_points:
-        forecast["metrics_raw"] = scored(raw_scores)
-        forecast["calibration"] = calibration_info(calibrator, calibration, calibrated_points / (forecasts * plan.points),
-                                                   first_t, history_t, history_w)
-    forecast["vehicles"] = {vehicle: stored[vehicle] for vehicle in sorted(stored)}
+    forecasts = sum(len(entries) for entries in stored.values())
     origins = len({entry["t"] for entries in stored.values() for entry in entries})
     return ForecastResult(forecast, len(stored), origins, forecasts, forecasts * plan.points, skipped)
 

@@ -23,9 +23,6 @@ const HIDDEN_RELEASE_DELAY := 0.5 # Seconds before a selected bus whose line was
 @onready var rmq_connection = $rmq_listener
 @onready var map_interpolation = $MapInterpolation
 
-var root
-var key_point_scene = preload("res://key_point.tscn")
-var bus_scene = preload("res://bus.tscn")
 var bus_3D_scene = preload("res://bus_3D.tscn")
 var bus_stop = preload("res://bus_stop.tscn")
 
@@ -68,7 +65,6 @@ var _selftest_checks := {} # Selection switch, stop highlight, Lines panel and l
 func _ready() -> void:
 	# Beacon colors compensate the scene's tonemapping (before any bus, i.e. any beacon material, exists)
 	Occupancy.set_environment($WorldEnvironment.environment)
-	root = get_tree().get_root()
 	var selftest_arg = ReplayPlayerScript.get_user_arg("selftest")
 	if selftest_arg is String and selftest_arg != "":
 		_selftest_path = selftest_arg
@@ -135,16 +131,19 @@ func _process(_delta: float) -> void:
 	_sync_occupancy_panel()
 	_sync_stop_highlight()
 
+## The selected object when it is one of the buses shown, else null
+func _selected_bus() -> Bus3D:
+	var selected = $Camera3D.selected_object
+	return selected if is_instance_valid(selected) and selected is Bus3D and buses.get(String(selected.name)) == selected else null
+
 ## Shows the chart of the selected bus and keeps its clock running
 func _sync_occupancy_panel() -> void:
 	if replay_mode:
 		occupancy_panel.set_time(replay_player.start_time + replay_player.get_display_time(), replay_player.utc_offset_seconds, true)
 	else:
 		occupancy_panel.set_time(Time.get_unix_time_from_system(), _system_utc_offset(), false)
-	var selected = $Camera3D.selected_object
-	var vehicle_id := ""
-	if is_instance_valid(selected) and selected is Bus3D and buses.get(String(selected.name)) == selected:
-		vehicle_id = String(selected.name)
+	var selected := _selected_bus()
+	var vehicle_id := String(selected.name) if selected != null else ""
 	if vehicle_id == occupancy_panel.vehicle_id:
 		return
 	if vehicle_id == "":
@@ -168,7 +167,7 @@ func spawn_bus_stops():
 	var stop_table: Dictionary = data.get("stops", {})
 	var by_id := {}
 	for route_id in routes_subscribed:
-		var route := _route_text(route_id)
+		var route := Occupancy.int_text(route_id)
 		var route_entry = routes.get(route)
 		if not route_entry is Dictionary or not route_entry.get("directions") is Dictionary:
 			continue
@@ -181,7 +180,7 @@ func spawn_bus_stops():
 				var stop = by_id.get(stop_id)
 				if stop == null:
 					var info = stop_table.get(stop_id)
-					if not info is Dictionary or not _is_number(info.get("lat")) or not _is_number(info.get("lon")):
+					if not info is Dictionary or not Occupancy.is_number(info.get("lat")) or not Occupancy.is_number(info.get("lon")):
 						continue
 					var node: Node3D = bus_stop.instantiate()
 					node.name = "Stop %s" % stop_id
@@ -234,8 +233,8 @@ func _apply_stop_styles() -> void:
 func _sync_stop_highlight() -> void:
 	var route := ""
 	var direction := -1
-	var selected = $Camera3D.selected_object
-	if is_instance_valid(selected) and selected is Bus3D and buses.get(String(selected.name)) == selected:
+	var selected := _selected_bus()
+	if selected != null:
 		route = selected.route_id
 		direction = selected.direction_id
 	if route == _highlight_route and direction == _highlight_direction:
@@ -328,12 +327,6 @@ func _on_lines_added(routes: PackedStringArray) -> void:
 static func _plural(word: String, items: PackedStringArray) -> String:
 	return "%s%s %s" % [word, "" if items.size() == 1 else "s", ", ".join(items)]
 
-## "51" for 51, 51.0 or "51"
-static func _route_text(route) -> String:
-	return str(int(route)) if (route is float and route == floorf(route)) or route is int else str(route)
-
-static func _is_number(value) -> bool:
-	return value is float or value is int
 
 ## Discovers the replays and plays the one given with --replay=<path> (strict), otherwise
 ## the first discovered one that loads (a broken drop-in file does not hide the bundled replay)
@@ -427,7 +420,7 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 		var route_id = entity.get('vehicle.trip.route_id')
 		if route_id == null or not int(route_id) in routes_subscribed:
 			continue
-		var entity_id := _vehicle_key(entity)
+		var entity_id := OccupancyDataScript.vehicle_key(entity)
 		if entity_id == "" or not entity.has('vehicle.position.latitude') or not entity.has('vehicle.position.longitude'):
 			continue
 		updated[entity_id] = true
@@ -435,8 +428,8 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 		var bus_3d: Bus3D = buses.get(entity_id)
 		if bus_3d != null:
 			_update_bus_state(bus_3d, entity)
-		var latitude := _as_float(entity.get('vehicle.position.latitude'))
-		var longitude := _as_float(entity.get('vehicle.position.longitude'))
+		var latitude := ReplayPlayerScript.to_float(entity.get('vehicle.position.latitude'), 0.0)
+		var longitude := ReplayPlayerScript.to_float(entity.get('vehicle.position.longitude'), 0.0)
 		# (0, 0) means the bus has no GPS fix (seen in real feeds): keep it where it was. After a
 		# seek "where it was" belongs to another time, so let the prune remove it until its next fix
 		if absf(latitude) < 1.0 and absf(longitude) < 1.0:
@@ -450,11 +443,9 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 		if same_place and not snap:
 			continue
 		var is_new := bus_3d == null
-		var bearing := _as_float(entity.get('vehicle.position.bearing', 0))
-		var speed := _as_float(entity.get('vehicle.position.speed', 0))
+		var bearing := ReplayPlayerScript.to_float(entity.get('vehicle.position.bearing'), 0.0)
+		var speed := ReplayPlayerScript.to_float(entity.get('vehicle.position.speed'), 0.0)
 		var has_bearing: bool = entity.has('vehicle.position.bearing')
-		var raw_bearing := bearing
-		bearing -= 20 # Manual corrective delta, I don't know why I need it
 		if debug_prints:
 			print("Latitude: " + str(latitude))
 			print("Longitude: " + str(longitude))
@@ -469,9 +460,9 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 		var real_pos: Vector2 = cached[2] if same_place else map_interpolation.get_position_by_closest_triangulation(latitude, longitude)
 		_geo_cache[entity_id] = [latitude, longitude, real_pos]
 		# New buses appear directly at their position instead of flying in from the origin
-		set_transform_from_geodata(bus_3d, latitude, longitude, bearing, snap or is_new, real_pos)
+		bus_3d.on_update(Vector3(real_pos[0], 15, real_pos[1]), Time.get_ticks_msec(), snap or is_new)
 		if (snap or is_new) and has_bearing:
-			face_bearing(bus_3d, latitude, longitude, raw_bearing)
+			face_bearing(bus_3d, latitude, longitude, bearing)
 	if prune:
 		for vehicle_id in buses.keys():
 			if updated.has(vehicle_id):
@@ -493,13 +484,6 @@ func _update_bus_state(bus_3d: Bus3D, entity: Dictionary) -> void:
 	if route != bus_3d.route_id:
 		bus_3d.route_id = route
 		_apply_route_filter(bus_3d)
-
-func set_transform_from_geodata(object: Bus3D, lat: float, long: float, bearing: float, snap := false, real_pos = null):
-	# Get the real x and z positions from coordinates (unless the caller already has them)
-	if real_pos == null:
-		real_pos = map_interpolation.get_position_by_closest_triangulation(lat, long)
-	# Tell the bus object that a new message was received and send it data
-	object.on_update(Vector3(real_pos[0], 15, real_pos[1]), Time.get_ticks_msec(), snap)
 
 ## Turns a bus along its GTFS bearing (degrees clockwise from north) using a point a few meters ahead
 func face_bearing(object: Bus3D, lat: float, long: float, bearing_degrees: float):
@@ -595,16 +579,6 @@ func _map_bounds() -> AABB:
 		first = false
 	return bounds
 
-func _vehicle_key(entity: Dictionary) -> String:
-	return OccupancyDataScript.vehicle_key(entity)
-
-func _as_float(value, default_value := 0.0) -> float:
-	if value is float or value is int:
-		return float(value)
-	if value is String and value.is_valid_float():
-		return value.to_float()
-	return default_value
-
 func load_json_file(file_path: String):
 	var file := FileAccess.open(file_path, FileAccess.READ)
 	if file:
@@ -634,7 +608,7 @@ func routes_updated():
 	var names := {}
 	var route_entries: Dictionary = _load_route_stops().get("routes", {})
 	for route_id in routes_subscribed:
-		var route := _route_text(route_id)
+		var route := Occupancy.int_text(route_id)
 		if not routes.has(route):
 			routes.append(route)
 		var entry = route_entries.get(route)
@@ -688,7 +662,7 @@ func _check_selection_and_lines(first_bus: Bus3D) -> void:
 	await get_tree().process_frame
 	var route := first_bus.route_id
 	_selftest_checks["stops_spawned"] = _stops.size()
-	_selftest_checks["routes_with_stop_data"] = routes_subscribed.filter(func(route_id): return _load_route_stops().get("routes", {}).has(_route_text(route_id))).size()
+	_selftest_checks["routes_with_stop_data"] = routes_subscribed.filter(func(route_id): return _load_route_stops().get("routes", {}).has(Occupancy.int_text(route_id))).size()
 	_selftest_checks["highlighted_stops"] = _highlighted_stops
 	_selftest_checks["highlighted_line"] = "%s|%d" % [_highlight_route, _highlight_direction]
 	_selftest_checks["line_has_stop_data"] = _load_route_stops().get("routes", {}).has(route)
@@ -741,10 +715,11 @@ func _check_selection_and_lines(first_bus: Bus3D) -> void:
 		await get_tree().process_frame
 		var others := PackedStringArray()
 		for route_id in routes_subscribed:
-			if _route_text(route_id) != route:
-				others.append(_route_text(route_id))
+			if Occupancy.int_text(route_id) != route:
+				others.append(Occupancy.int_text(route_id))
 		others.sort()
-		steps["only_this_line"] = occupancy_panel.hidden_lines() == others and _lines_consistent() 			and buses.values().any(func(bus_3d): return bus_3d.visible)
+		steps["only_this_line"] = occupancy_panel.hidden_lines() == others and _lines_consistent() \
+			and buses.values().any(func(bus_3d): return bus_3d.visible)
 		_selftest_checks["only_line_buses_shown"] = buses.values().filter(func(bus_3d): return bus_3d.visible).size()
 		occupancy_panel.all_button().pressed.emit()
 		await get_tree().process_frame
@@ -763,7 +738,8 @@ func _check_selection_and_lines(first_bus: Bus3D) -> void:
 		button.pressed.emit()
 		button.gui_input.emit(double_click)
 		await get_tree().create_timer(settle).timeout
-		steps["double_click_keeps_selection"] = camera.selected_object == first_bus and first_bus.visible 			and occupancy_panel.hidden_lines() == others
+		steps["double_click_keeps_selection"] = camera.selected_object == first_bus and first_bus.visible \
+			and occupancy_panel.hidden_lines() == others
 		occupancy_panel.all_button().pressed.emit()
 		await get_tree().process_frame
 	_selftest_checks["lines_steps"] = steps
@@ -852,50 +828,45 @@ func _finish_selftest() -> void:
 	if _shot_error != "":
 		errors.append(_shot_error)
 	var buses_with_occupancy := count_buses_with_occupancy()
-	var occupancy_ok := true
+	# Occupancy, forecast and chart: any error appended below fails the test
+	var before_occupancy := errors.size()
+	var tooltip := String(_chart_stats.get("footer_tooltip", ""))
 	if loaded and occupancy_data.occupancy_known and buses_with_occupancy == 0:
 		errors.append("The replay has occupancy levels but no bus shows one")
-		occupancy_ok = false
 	if loaded and occupancy_data.forecast_in_replay:
+		var timing_error := _learning_timing_error()
 		if occupancy_data.forecast_error != "":
 			errors.append(occupancy_data.forecast_error)
-			occupancy_ok = false
 		elif _chart_stats.get("forecast_points", 0) == 0:
 			errors.append("The replay has a forecast but the chart of bus %s shows none (%s)" % [_chart_stats.get("vehicle", "-"), _chart_stats.get("message", "no bus selected")])
-			occupancy_ok = false
-		elif not occupancy_data.calibration.is_empty() and not String(_chart_stats.get("footer_tooltip", "")).contains("Calibrated:"):
-			errors.append("The forecast is calibrated but the chart's footer does not explain it: %s" % _chart_stats.get("footer_tooltip", ""))
-			occupancy_ok = false
-		elif _calibration_timing_error() != "":
-			errors.append(_calibration_timing_error())
-			occupancy_ok = false
+		elif not occupancy_data.calibration.is_empty() and not tooltip.contains("Calibrated:"):
+			errors.append("The forecast is calibrated but the chart's footer does not explain it: %s" % tooltip)
+		elif not occupancy_data.training.is_empty() and not tooltip.contains("shows no change"):
+			errors.append("The forecast is the location model's but the chart's footer does not explain it: %s" % tooltip)
+		elif timing_error != "":
+			errors.append(timing_error)
 	# The chart itself, with or without a forecast (the replay is paused: now is when the stats were taken)
 	if loaded and not buses.is_empty():
 		if not _chart_stats.get("visible", false) or _chart_stats.get("vehicle", "") != _chart_bus_id:
 			errors.append("The chart is not shown for the selected bus %s (chart: visible=%s, bus \"%s\")" % [_chart_bus_id if _chart_bus_id != "" else "(none could be selected)", str(_chart_stats.get("visible", false)), _chart_stats.get("vehicle", "")])
-			occupancy_ok = false
 		elif Occupancy.is_level(occupancy_data.status_at(_chart_bus_id, replay_player.start_time + replay_player.get_display_time())) and _chart_stats.get("history_points", 0) == 0:
 			errors.append("The chart of bus %s shows no occupancy history" % _chart_bus_id)
-			occupancy_ok = false
+	var occupancy_ok := errors.size() == before_occupancy
 	# Selecting another bus, the stops of the selected line and the line filter
-	var lines_ok := true
+	var before_lines := errors.size()
 	if loaded and _chart_bus_id != "":
 		if not _selftest_checks.get("selection_switch_ok", false):
 			errors.append("Selecting another bus did not release bus %s" % _chart_bus_id)
-			lines_ok = false
 		if _selftest_checks.get("routes_with_stop_data", 0) > 0 and _selftest_checks.get("stops_spawned", 0) == 0:
 			errors.append("No bus stop was placed, though %s has stops for the replay's routes" % ROUTE_STOPS_PATH)
-			lines_ok = false
 		if _selftest_checks.get("line_has_stop_data", false) and (_selftest_checks.get("highlighted_stops", 0) == 0 \
 				or not _selftest_checks.get("highlight_ok", false) or not _selftest_checks.get("highlight_follows_ok", true)):
 			errors.append("The stops of the selected bus's line are not highlighted right: %s" % JSON.stringify(_selftest_checks))
-			lines_ok = false
 		if not _selftest_checks.get("lines_ok", false):
 			errors.append("The Lines panel failed: %s" % JSON.stringify(_selftest_checks))
-			lines_ok = false
 		if not _selftest_checks.get("layers_ok", false):
 			errors.append("The legend checkboxes failed: %s" % JSON.stringify(_selftest_checks.get("layers", {})))
-			lines_ok = false
+	var lines_ok := errors.size() == before_lines
 	var logged := _selftest_logger.take()
 	errors.append_array(logged["errors"])
 	var ok: bool = loaded and _frames_emitted >= 3 and not buses.is_empty() and occupancy_ok and lines_ok and logged["script_errors"] == 0
@@ -929,7 +900,8 @@ func _finish_selftest() -> void:
 		"forecast_vehicles": occupancy_data.vehicle_count,
 		"forecast_origins": occupancy_data.origin_count,
 		"forecast_calibrated": not occupancy_data.calibration.is_empty(),
-		"chart_calibration_note": _chart_stats.get("calibration_note", ""),
+		"forecast_trained": not occupancy_data.training.is_empty(),
+		"chart_learning_note": _chart_stats.get("learning_note", ""),
 		"chart_footer_tooltip": _chart_stats.get("footer_tooltip", ""),
 		"chart_visible": _chart_stats.get("visible", false),
 		"chart_vehicle": _chart_stats.get("vehicle", ""),
@@ -958,19 +930,19 @@ func _finish_selftest() -> void:
 	OS.remove_logger(_selftest_logger)
 	get_tree().quit(exit_code)
 
-## Self-test: "" when a calibrated forecast is raw at its first forecast time (nothing learned yet) and, at its last,
-## still learning only if a point was never calibrated (a short replay); else what is wrong
-func _calibration_timing_error() -> String:
-	var calibration: Dictionary = occupancy_data.calibration
-	if calibration.is_empty() or calibration["history"]["t"].is_empty():
+## Self-test: "" when a calibrated forecast (or the location model's) is still learning at its first forecast time
+## (nothing learned yet) and, at its last, only if a point never learned (a short replay); else what is wrong
+func _learning_timing_error() -> String:
+	var learned := occupancy_data.learned()
+	if learned.is_empty() or learned["history"]["t"].is_empty():
 		return ""
-	var times: Array = calibration["history"]["t"]
-	var at_first := occupancy_data.calibration_learning(replay_player.start_time + float(times[0]))
-	var at_last := occupancy_data.calibration_learning(replay_player.start_time + float(times[times.size() - 1]))
-	if at_first and at_last == calibration["first_t"].has(null):
+	var times: Array = learned["history"]["t"]
+	var at_first := occupancy_data.learning_note(replay_player.start_time + float(times[0])) != ""
+	var at_last := occupancy_data.learning_note(replay_player.start_time + float(times[times.size() - 1])) != ""
+	if at_first and at_last == learned["first_t"].has(null):
 		return ""
-	return "The calibration's start times are wrong: still learning at the first forecast time %s, at the last %s (never calibrated points: %s)" % [
-		at_first, at_last, calibration["first_t"].has(null)]
+	return "The learning start times are wrong: still learning at the first forecast time %s, at the last %s (points that never learned: %s)" % [
+		at_first, at_last, learned["first_t"].has(null)]
 
 ## Saves the current view as a PNG; returns the path, or "" (reason in _shot_error).
 ## Headless runs render nothing, so there is no screenshot then.

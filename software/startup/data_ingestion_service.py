@@ -8,8 +8,6 @@ from communication.protocol import ROUTING_KEY_STM_TELEMETRY_VALIDATION, ROUTING
 from communication.stm_api import fetch_feed, extract_timestamp, filter_vehicle_entities, flatten_entities
 
 config_logger("config/logging.conf")
-# fileConfig disables the loggers that already exist; this one was created when communication.stm_api was imported
-logging.getLogger("StmApi").disabled = False
 
 def to_queue_format(_bytes) -> dict:
 

@@ -24,9 +24,6 @@ var direction_id := -1 # Direction (0 or 1) of its trip, -1 unknown
 var filtered_out := false # Hidden by the line filter
 var _collision_layer := 1
 
-## Outline of the selected bus: the color of its chart (occupancy_panel.gd SERIES_COLOR), apart from the beacon colors
-const SELECTED_OUTLINE := Color("#3987e5")
-
 @export var FOLLOW_SPEED = 4.0
 var t = 0.0
 # Replay speed multiplier (1.0 in live mode), scales the smoothing so buses keep up with fast playback
@@ -34,7 +31,8 @@ static var playback_speed := 1.0
 
 func _ready() -> void:
 	original_outline_color = bus_mesh.get_surface_override_material(0).next_pass.get_shader_parameter("outline_color")
-	outline_color = Occupancy.screen_albedo(SELECTED_OUTLINE) # The outline shader is unshaded: undo the tonemapping
+	# The selected bus's outline has the color of its chart; the outline shader is unshaded: undo the tonemapping
+	outline_color = Occupancy.screen_albedo(Occupancy.SELECTED_COLOR)
 	_collision_layer = body.collision_layer
 	if occupancy_status == -2:
 		set_occupancy(Occupancy.NO_DATA)
@@ -52,10 +50,8 @@ func on_update(_target_pos: Vector3, _time: float, snap := false):
 	# If a new position was determined to move to
 	if _target_pos.x != target_position.x and _target_pos.z != target_position.z:
 		_target_pos.y = ground_y(_target_pos + Vector3(0, 100, 0))
-		target_position.y = _target_pos.y # Same spot: one raycast is enough
-		last_position.y = target_position.y
-		
-		last_position = target_position
+		# Glide from the previous target, at the new ground height (one raycast is enough)
+		last_position = Vector3(target_position.x, _target_pos.y, target_position.z)
 		target_position = _target_pos
 		t = 0
 		estimated_position = _target_pos + (_target_pos - last_position)

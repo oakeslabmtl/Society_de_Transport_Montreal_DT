@@ -2,7 +2,6 @@ import csv
 import io
 import json
 import logging
-import os
 import zipfile
 import zlib
 from collections import Counter, defaultdict
@@ -10,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from recording import RecordingError
-from recording.paths import repo_relative
+from recording.paths import repo_relative, write_text_atomic
 from recording.store import utc_now_iso
 
 # The stops of every bus line, for the Godot viewer to highlight those of the selected bus's line.
@@ -131,13 +130,8 @@ def merge_patterns(patterns:Counter) -> list[str]:
 
 def write_route_stops(data:dict, path:Path) -> int:
     """Compact UTF-8 JSON with sorted keys (same input, same file), written atomically. Returns the file size in bytes."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n"
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(text.encode("utf-8"))
-    os.replace(temporary, path)
-    return path.stat().st_size
+    return write_text_atomic(json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                        allow_nan=False) + "\n", path)
 
 
 def _read_bus_routes(gtfs:Path) -> dict[str, str]:

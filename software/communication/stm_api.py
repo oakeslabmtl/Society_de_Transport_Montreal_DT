@@ -1,14 +1,17 @@
 import logging
 import requests
-import pandas as pd
 from google.transit.gtfs_realtime_pb2 import FeedMessage
 from protobuf_to_dict import protobuf_to_dict
 
 # Shared by the live DataIngestionService and the recorder (software/recording) so that recorded
 # entities have exactly the same keys and types as the live RabbitMQ messages.
 # Does not import communication.protocol: that module needs STM_API_KEY at import time.
+# The "StmApi" logger is looked up when used: logging.config.fileConfig (config_logger) disables the loggers that
+# already exist when it runs, and the services configure logging after importing this module.
 
-logger = logging.getLogger("StmApi")
+
+def _logger() -> logging.Logger:
+    return logging.getLogger("StmApi")
 
 
 def fetch_feed(url:str, headers:dict, timeout:float=None, check_status:bool=False) -> FeedMessage:
@@ -24,7 +27,7 @@ def extract_timestamp(entity:dict) -> int:
     try:
         return int(entity['vehicle']['timestamp'])
     except KeyError as e:
-        logger.error(f"Error at extracting timestamp: {str(e)}")
+        _logger().error(f"Error at extracting timestamp: {str(e)}")
         return 0
 
 
@@ -36,7 +39,7 @@ def filter_vehicle_entities(feed:FeedMessage, route_ids:list[int]=None, sort:boo
 
     for entity in feed_dict.get('entity', []):
         if 'vehicle' in entity and 'trip' in entity['vehicle'] and 'route_id' in entity['vehicle']['trip']:
-            logger.debug(f"Retrieved entity: {entity}")
+            _logger().debug(f"Retrieved entity: {entity}")
 
             route_id = int(entity['vehicle']['trip']['route_id'])
             if (not route_ids) or (route_id in route_ids):
@@ -47,8 +50,16 @@ def filter_vehicle_entities(feed:FeedMessage, route_ids:list[int]=None, sort:boo
 
 
 def flatten_entities(data:list[dict]) -> list[dict]:
-    """Nested entities -> flat dicts with dotted keys, e.g. 'vehicle.position.latitude'."""
-    flatten_data = []
-    for entity in data:
-        flatten_data.append(pd.json_normalize(entity).T.to_dict()[0])
-    return flatten_data
+    """Nested entities -> flat dicts with dotted keys, e.g. 'vehicle.position.latitude' (as pandas.json_normalize:
+    empty nested dicts disappear, lists stay values)."""
+    return [_flatten(entity) for entity in data]
+
+
+def _flatten(value:dict, prefix:str="") -> dict:
+    flat = {}
+    for key, item in value.items():
+        if isinstance(item, dict):
+            flat.update(_flatten(item, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = item
+    return flat

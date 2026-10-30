@@ -17,6 +17,16 @@ def repo_relative(path:Path) -> str:
         return path.name
 
 
+def write_text_atomic(text:str, path:Path) -> int:
+    """Writes UTF-8 text through a temporary file, so a reader never sees half a file. Returns the size in bytes."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(text.encode("utf-8"))
+    os.replace(temporary, path)
+    return path.stat().st_size
+
+
 def display_path(path:Path) -> str:
     """Short path for messages: relative to the current folder when inside the repo, else absolute."""
     path = Path(path).resolve()
