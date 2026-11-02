@@ -5,6 +5,8 @@ const ReplayControlsScript = preload("res://scripts/replay_controls.gd")
 const Occupancy = preload("res://scripts/occupancy.gd")
 const OccupancyDataScript = preload("res://scripts/occupancy_data.gd")
 const OccupancyPanelScript = preload("res://scripts/occupancy_panel.gd")
+const QualityScript = preload("res://scripts/quality.gd")
+const SettingsPanelScript = preload("res://scripts/settings_panel.gd")
 const SELFTEST_SPEED := 60.0
 const SELFTEST_SECONDS := 5.0
 const SHOT_DELAY := 2.5 # Real seconds at the default speed before the self-test screenshot
@@ -19,6 +21,9 @@ const ROUTE_STOPS_PATH := "res://assets/route_stops.json"
 const STOP_HIGHLIGHT_SCALE := Vector3(1.6, 1.0, 1.6) # Poles of the selected bus's line are thicker
 const MISSED_FRAMES_KEPT := 3 # Replay: a bus absent from up to this many polls in a row (45 s) stays where it was
 const HIDDEN_RELEASE_DELAY := 0.5 # Seconds before a selected bus whose line was hidden is released (see _on_lines_hidden_changed)
+const FRAME_CHECK_WARMUP := 3.0 # First start: seconds before measuring the frame rate (shaders compile meanwhile)
+const FRAME_CHECK_SECONDS := 5.0
+const MIN_SMOOTH_FPS := 24.0 # First start: below this, the GPU's preset is lowered (quality.gd)
 
 @onready var rmq_connection = $rmq_listener
 @onready var map_interpolation = $MapInterpolation
@@ -35,6 +40,8 @@ var replay_player: ReplayPlayerScript
 var replay_controls: ReplayControlsScript
 var occupancy_data: OccupancyDataScript
 var occupancy_panel: OccupancyPanelScript
+var settings_panel: SettingsPanelScript
+var quality: QualityScript
 var replay_entries: Array = []
 var _load_errors := PackedStringArray()
 var _geo_cache := {} # vehicle id -> [latitude, longitude, map position] of its last applied update
@@ -43,6 +50,8 @@ var _view_framed := false
 var _route_stops = null # route_stops.json, loaded once: {"stops": {id: {name, lat, lon}}, "routes": {route: {name, directions}}}
 var _stops: Array[Dictionary] = [] # Spawned stops: {"node", "pole", "routes": {route: true}, "lines": {"route|direction": true}}
 var _stop_materials := {} # "normal" / "other" -> StandardMaterial3D
+var _other_stops_shown := true # "Other stops" in the legend: the other lines' stops while a line is highlighted
+var _map_chunks: Array = [] # The city's MeshInstance3D chunks
 var _hidden_routes := {} # route -> true: lines hidden in the Lines panel (their buses and stops)
 var _highlight_route := "" # Line of the selected bus whose stops are highlighted, "" when none
 var _highlight_direction := -1 # ... its direction, -1 = both
@@ -58,9 +67,12 @@ var _shot_saved := ""
 var _shot_error := ""
 var _shot_chart_path := ""
 var _shot_chart_saved := ""
+var _shot_settings_path := ""
+var _shot_settings_saved := ""
 var _chart_stats := {}
 var _chart_bus_id := ""
 var _selftest_checks := {} # Selection switch, stop highlight, Lines panel and layer checkbox results
+var _display_checks := {} # Display presets, saved settings, panel layout and Hide UI results
 
 func _ready() -> void:
 	# Beacon colors compensate the scene's tonemapping (before any bus, i.e. any beacon material, exists)
@@ -76,6 +88,21 @@ func _ready() -> void:
 		var shot_chart_arg = ReplayPlayerScript.get_user_arg("shot-chart")
 		if shot_chart_arg is String:
 			_shot_chart_path = shot_chart_arg
+		var shot_settings_arg = ReplayPlayerScript.get_user_arg("shot-settings")
+		if shot_settings_arg is String:
+			_shot_settings_path = shot_settings_arg
+
+	# Display quality: the saved settings (the self-test neither reads nor saves them: High, or --quality=<preset> for
+	# this run). An exported build starts lower after a run that did not end normally
+	quality = QualityScript.new()
+	var forced_quality = ReplayPlayerScript.get_user_arg("quality")
+	if not forced_quality is String:
+		forced_quality = "high" if _selftest_path != "" else ""
+	quality.load_settings("" if _selftest_path != "" else QualityScript.SETTINGS_PATH, forced_quality, not OS.has_feature("editor"))
+	_map_chunks = $Map.find_children("*", "MeshInstance3D", true, false)
+	for reference in $MapInterpolation/ReferencePoints.get_children():
+		reference.get_child(0).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF # A marker: no shadow
+	_apply_quality()
 
 	bus_container = Node3D.new()
 	bus_container.name = "Buses"
@@ -104,6 +131,18 @@ func _ready() -> void:
 	occupancy_panel.layer_toggled.connect(_on_layer_toggled)
 	_update_marker_legend()
 
+	# Toolbar (Legend, Settings, Hide UI) and the display settings, at the top right above the legend
+	settings_panel = SettingsPanelScript.new()
+	settings_panel.column_changed.connect(occupancy_panel.set_right_column)
+	settings_panel.settings_changed.connect(_apply_quality)
+	settings_panel.legend_toggled.connect(_on_legend_toggled)
+	settings_panel.panel_toggled.connect(func(_open: bool): _sync_legend())
+	settings_panel.ui_hidden_changed.connect(_on_ui_hidden_changed)
+	replay_controls.layout_changed.connect(settings_panel.fit_above_bar)
+	add_child(settings_panel)
+	settings_panel.setup(quality, func(): return replay_controls.bar_rect().position.y if replay_controls.visible else get_viewport().get_visible_rect().size.y)
+	_sync_legend()
+
 	replay_mode = OS.has_feature("demo") or ReplayPlayerScript.get_user_arg("replay") != null or _selftest_path != ""
 	var live_failed := false
 	if not replay_mode:
@@ -126,6 +165,12 @@ func _ready() -> void:
 
 	if _selftest_path != "":
 		_run_selftest()
+	elif quality.auto:
+		_check_frame_rate()
+
+## A normal exit (window closed, end of the self-test): the next start keeps the settings (quality.gd)
+func _exit_tree() -> void:
+	quality.save(false)
 
 func _process(_delta: float) -> void:
 	_sync_occupancy_panel()
@@ -150,6 +195,55 @@ func _sync_occupancy_panel() -> void:
 		occupancy_panel.hide_chart()
 	else:
 		occupancy_panel.show_bus(vehicle_id)
+
+## Applies the display settings to the view, the map and every bus (quality.gd)
+func _apply_quality() -> void:
+	quality.apply_render(get_viewport(), $DirectionalLight3D, $WorldEnvironment.environment)
+	quality.apply_view_distance(_map_chunks)
+	for bus_3d in buses.values():
+		bus_3d.set_headlights(quality.values["headlights"])
+
+## First start: lowers the preset chosen from the GPU, one step at a time, while the view is not smooth. A minimized
+## window draws nothing: that measure does not count, the next one does
+func _check_frame_rate() -> void:
+	await get_tree().create_timer(FRAME_CHECK_WARMUP).timeout
+	while quality.auto:
+		var frames := Engine.get_frames_drawn()
+		var start := Time.get_ticks_usec()
+		var minimized := get_window().mode == Window.MODE_MINIMIZED
+		await get_tree().create_timer(FRAME_CHECK_SECONDS).timeout
+		if not quality.auto: # The user chose settings meanwhile
+			return
+		if minimized or get_window().mode == Window.MODE_MINIMIZED or Engine.get_frames_drawn() == frames:
+			continue
+		var fps := (Engine.get_frames_drawn() - frames) / ((Time.get_ticks_usec() - start) / 1e6)
+		if fps >= MIN_SMOOTH_FPS or not quality.step_down():
+			quality.auto = false
+			quality.save()
+			return
+		_apply_quality()
+		settings_panel.refresh()
+		settings_panel.show_note("The view was not smooth (%d fps): quality lowered to %s. Change it in Settings." % [
+			roundi(fps), QualityScript.preset_label(quality.preset)])
+		await get_tree().create_timer(FRAME_CHECK_WARMUP).timeout
+
+## Legend button: showing the legend closes the settings, which take its place
+func _on_legend_toggled(shown: bool) -> void:
+	quality.set_value("legend", shown)
+	if shown and settings_panel.is_panel_open():
+		settings_panel.set_panel_open(false)
+	_sync_legend()
+
+## The legend shows unless hidden from the toolbar, or while the settings take its place (in a narrow window, the
+## chart's too)
+func _sync_legend() -> void:
+	var open := settings_panel.is_panel_open()
+	occupancy_panel.set_legend_shown(quality.values["legend"] and not open, open)
+
+## Hide UI: every panel goes (clicks then reach the 3D view); the settings panel keeps its "Show UI" button
+func _on_ui_hidden_changed(hidden: bool) -> void:
+	occupancy_panel.visible = not hidden
+	replay_controls.visible = not hidden
 
 ## Offset of the system time zone from UTC in seconds (daylight saving time included)
 static func _system_utc_offset() -> int:
@@ -184,6 +278,7 @@ func spawn_bus_stops():
 						continue
 					var node: Node3D = bus_stop.instantiate()
 					node.name = "Stop %s" % stop_id
+					node.get_child(0).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF # A 200 m pole: no shadow
 					var real_stop_pos: Vector2 = map_interpolation.get_position_by_closest_triangulation(float(info["lat"]), float(info["lon"]))
 					node.position = Vector3(real_stop_pos[0], 0, real_stop_pos[1])
 					$BusStops.add_child(node)
@@ -203,13 +298,14 @@ func _load_route_stops() -> Dictionary:
 			_route_stops = {}
 	return _route_stops
 
-## Highlights the stops of the selected bus's line (its direction when known) and fades the others; hides the stops
-## whose lines are all hidden in the Lines panel
+## Highlights the stops of the selected bus's line (its direction when known) and fades the others (or hides them:
+## "Other stops" unchecked); hides the stops whose lines are all hidden in the Lines panel
 func _apply_stop_styles() -> void:
 	if _stop_materials.is_empty():
 		for key in ["normal", "other"]:
 			var mat := StandardMaterial3D.new()
 			mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+			mat.disable_fog = true # Like the beacons, the stops stay visible beyond the view-distance haze
 			mat.albedo_color = Occupancy.screen_albedo(OccupancyPanelScript.STOP_COLOR if key == "normal" else OccupancyPanelScript.OTHER_STOP_COLOR)
 			_stop_materials[key] = mat
 	var line := "%s|%d" % [_highlight_route, _highlight_direction]
@@ -223,11 +319,14 @@ func _apply_stop_styles() -> void:
 		if node.visible and _highlight_route != "" and (stop["lines"].has(line) if _highlight_direction >= 0 else stop["routes"].has(_highlight_route)):
 			highlighted[i] = 1
 			_highlighted_stops += 1
-	# Faded only while some stops are highlighted (a line without stop data leaves them as they are)
+	# Faded (or hidden) only while some stops are highlighted (a line without stop data leaves them as they are)
 	for i in _stops.size():
 		var is_highlighted := highlighted[i] == 1
-		_stops[i]["pole"].material_override = _stop_materials["normal" if is_highlighted or _highlighted_stops == 0 else "other"]
+		var other := _highlighted_stops > 0 and not is_highlighted
+		_stops[i]["pole"].material_override = _stop_materials["other" if other else "normal"]
 		_stops[i]["node"].scale = STOP_HIGHLIGHT_SCALE if is_highlighted else Vector3.ONE
+		if other and not _other_stops_shown:
+			_stops[i]["node"].visible = false
 
 ## Follows the selected bus's line and direction (they change at a terminus, or when a vehicle starts another route)
 func _sync_stop_highlight() -> void:
@@ -252,7 +351,7 @@ func _update_marker_legend() -> void:
 		var headsign = _route_direction(_highlight_route, _highlight_direction).get("headsign", "")
 		if headsign is String and headsign != "":
 			line_stops += " (%s)" % headsign # STM's bus headsigns are mostly a direction: "Nord", "Est"...
-	occupancy_panel.set_marker_legend($BusStops.visible, $MapInterpolation/ReferencePoints.visible, line_stops)
+	occupancy_panel.set_marker_legend($BusStops.visible, _other_stops_shown, $MapInterpolation/ReferencePoints.visible, line_stops)
 
 ## route_stops.json entry of a route's direction ({} when unknown)
 func _route_direction(route: String, direction: int) -> Dictionary:
@@ -262,10 +361,15 @@ func _route_direction(route: String, direction: int) -> Dictionary:
 	var entry = route_entry["directions"].get(str(direction))
 	return entry if entry is Dictionary else {}
 
-## Legend checkboxes: shows or hides the bus stops or the reference points
+## Legend checkboxes: shows or hides the bus stops, the other lines' stops (while a line is highlighted) or the
+## reference points
 func _on_layer_toggled(layer: String, shown: bool) -> void:
-	var node: Node3D = $BusStops if layer == "stops" else $MapInterpolation/ReferencePoints
-	node.visible = shown
+	if layer == "other_stops":
+		_other_stops_shown = shown
+		_apply_stop_styles()
+	else:
+		var node: Node3D = $BusStops if layer == "stops" else $MapInterpolation/ReferencePoints
+		node.visible = shown
 	_update_marker_legend()
 
 ## Lines panel: hides the buses and stops of these lines; a hidden selected bus is released a moment later
@@ -455,6 +559,7 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 			bus_3d = bus_3D_scene.instantiate()
 			bus_3d.name = entity_id
 			bus_container.add_child(bus_3d)
+			bus_3d.set_headlights(quality.values["headlights"])
 			buses[entity_id] = bus_3d
 			_update_bus_state(bus_3d, entity)
 		var real_pos: Vector2 = cached[2] if same_place else map_interpolation.get_position_by_closest_triangulation(latitude, longitude)
@@ -573,7 +678,7 @@ func frame_busy_area() -> bool:
 func _map_bounds() -> AABB:
 	var bounds := AABB()
 	var first := true
-	for mesh in $Map.find_children("*", "MeshInstance3D", true, false):
+	for mesh: MeshInstance3D in _map_chunks:
 		var box: AABB = mesh.global_transform * mesh.get_aabb()
 		bounds = box if first else bounds.merge(box)
 		first = false
@@ -625,7 +730,8 @@ func routes_updated():
 ## then pauses and selects a bus to check its occupancy chart, writes a JSON report and quits with
 ## 0 (ok) or 1. Used to check exported builds without stdout.
 ## With --shot=<file.png> (windowed runs), first saves a screenshot of the start view at the default speed;
-## with --shot-chart=<file.png>, one with the chart shown (hovered at the forecast origin, "Show actual" on).
+## with --shot-chart=<file.png>, one with the chart shown (hovered at the forecast origin, "Show actual" on);
+## with --shot-settings=<file.png>, one with the display settings open.
 func _run_selftest() -> void:
 	if replay_player.has_frames():
 		if _shot_path != "":
@@ -653,6 +759,7 @@ func _run_selftest() -> void:
 				await get_tree().create_timer(CHART_DELAY).timeout
 				_shot_chart_saved = await _save_screenshot(_shot_chart_path)
 			await _check_selection_and_lines(chart_bus)
+		await _check_display()
 	_finish_selftest()
 
 ## Self-test of the stops of the selected bus's line, of selecting another bus (the first one must be released), of the
@@ -758,18 +865,146 @@ func _check_selection_and_lines(first_bus: Bus3D) -> void:
 	layers["references_on"] = $MapInterpolation/ReferencePoints.visible
 	references_check.button_pressed = false
 	layers["references_off"] = not $MapInterpolation/ReferencePoints.visible
+	# "Other stops" while the first bus's line is highlighted: unchecked, only that line's stops stay. It does nothing
+	# while no line is highlighted. Checked whenever the line has stops
+	var other_check := occupancy_panel.layer_check("other_stops")
+	layers["other_stops_checked"] = _highlighted_stops > 0 or not _selftest_checks.get("line_has_stop_data", false)
+	if _highlighted_stops > 0:
+		layers["other_stops_offered"] = other_check.visible
+		other_check.button_pressed = false
+		layers["other_stops_off"] = _lines_consistent() and _stops.all(func(stop): return stop["node"].visible == (stop["node"].scale == STOP_HIGHLIGHT_SCALE))
+		camera.reset_camera()
+		await get_tree().process_frame
+		layers["other_stops_need_a_line"] = not other_check.visible and _lines_consistent() and _stops.all(func(stop): return stop["node"].visible)
+		camera.select_object(first_bus)
+		await get_tree().process_frame
+		other_check.button_pressed = true
+		layers["other_stops_on"] = _lines_consistent() and _stops.filter(func(stop): return stop["node"].visible).size() > _highlighted_stops
 	_selftest_checks["layers"] = layers
 	_selftest_checks["layers_ok"] = layers.values().all(func(ok): return ok)
 
+## Self-test of the display settings and the UI around them; results in _display_checks. Every preset applies (shadows,
+## resolution, view distance and headlights), the settings survive a save and a load (a run that did not
+## end normally restarts lower), the panels do not overlap, and Hide UI (the H key) hides them all
+func _check_display() -> void:
+	var initial := quality.preset
+	var presets := {}
+	for preset in QualityScript.PRESETS:
+		settings_panel.select_preset(preset)
+		await get_tree().process_frame
+		presets[preset] = quality.preset == preset and _display_matches(QualityScript.PRESET_VALUES[preset])
+	_display_checks["presets"] = presets
+	if initial in QualityScript.PRESETS:
+		settings_panel.select_preset(initial)
+
+	# Saved settings, in a file of the self-test's own, as the exported viewer keeps them (crash check on)
+	var path := "user://selftest_settings.cfg"
+	DirAccess.remove_absolute(path)
+	var saved := QualityScript.new()
+	saved.load_settings(path, "", true) # No file yet: the GPU's preset
+	var first_start: bool = saved.auto and saved.preset == QualityScript.recommended_preset()
+	saved.set_preset("medium")
+	saved.set_value("antialiasing", "fxaa")
+	saved.set_value("legend", false)
+	var reloaded := QualityScript.new()
+	reloaded.load_settings(path)
+	_display_checks["settings_saved"] = first_start and reloaded.values.recursive_equal(saved.values, 1) \
+		and reloaded.preset == QualityScript.CUSTOM and not reloaded.auto
+	# The file still says the last run is running (it did not end normally): the next start is lower, with a note. Custom
+	# settings weigh what their shadows do: Medium ones restart at Low, Minimum ones stay at Minimum
+	var after_crash := QualityScript.new()
+	after_crash.load_settings(path, "", true)
+	var lowered: bool = after_crash.preset == "low" and after_crash.note != ""
+	after_crash.save(false)
+	# An editor run (no crash check, killed by the editor's Stop button) leaves the marker as it found it
+	var editor_run := QualityScript.new()
+	editor_run.load_settings(path)
+	var after_exit := QualityScript.new()
+	after_exit.load_settings(path, "", true)
+	_display_checks["normal_exit_kept"] = after_exit.preset == "low" and after_exit.note == ""
+	after_exit.set_preset("minimum")
+	after_exit.set_value("antialiasing", "fxaa")
+	var light_crash := QualityScript.new()
+	light_crash.load_settings(path, "", true)
+	_display_checks["crash_restart_lower"] = lowered and light_crash.preset == "minimum" and light_crash.note.contains("safe mode")
+	DirAccess.remove_absolute(path)
+
+	# The panels do not overlap, with the legend and then with the settings in its place (a bus selected: the chart shows).
+	# A headless run has no real window (64x64): no layout to check
+	var bus := _pick_chart_bus()
+	if bus != null:
+		$Camera3D.select_object(bus)
+	await get_tree().create_timer(CHART_DELAY).timeout
+	var headless := DisplayServer.get_name() == "headless"
+	var overlaps := PackedStringArray() if headless else _overlapping_panels()
+	settings_panel.set_panel_open(true)
+	await get_tree().process_frame
+	if not headless:
+		overlaps.append_array(_overlapping_panels())
+	if _shot_settings_path != "":
+		_shot_settings_saved = await _save_screenshot(_shot_settings_path)
+	settings_panel.set_panel_open(false)
+	_display_checks["overlaps"] = overlaps
+	_display_checks["window"] = "headless: layout not checked" if headless else str(get_viewport().get_visible_rect().size)
+
+	# Hide UI with the H key; the "Show UI" button goes once the mouse stays still and comes back when it moves; H again
+	var key := InputEventKey.new()
+	key.keycode = KEY_H
+	key.pressed = true
+	Input.parse_input_event(key)
+	await get_tree().process_frame
+	var hidden: bool = settings_panel.ui_hidden and not occupancy_panel.visible and not replay_controls.visible \
+		and not settings_panel.rects().has("toolbar")
+	await get_tree().create_timer(SettingsPanelScript.SHOW_BUTTON_SECONDS + 0.5).timeout
+	var button_faded := not settings_panel.show_button_visible()
+	var motion := InputEventMouseMotion.new()
+	motion.position = get_viewport().get_visible_rect().size * 0.5
+	motion.relative = Vector2(4, 0)
+	Input.parse_input_event(motion)
+	await get_tree().process_frame
+	var button_back := settings_panel.show_button_visible()
+	Input.parse_input_event(key)
+	await get_tree().process_frame
+	_display_checks["hide_ui"] = {"hidden": hidden, "show_button_faded": button_faded, "show_button_back": button_back,
+		"shown_again": not settings_panel.ui_hidden and occupancy_panel.visible and replay_controls.visible}
+
+## Self-test: the scene shows these display settings
+func _display_matches(expected: Dictionary) -> bool:
+	for bus_3d: Bus3D in buses.values():
+		if bus_3d.get_node("SpotLight3D").visible != expected["headlights"]:
+			return false
+	return $DirectionalLight3D.shadow_enabled == (expected["shadows"] != "off") \
+		and is_equal_approx(get_viewport().scaling_3d_scale, expected["render_scale"]) \
+		and $WorldEnvironment.environment.fog_enabled == (expected["view_distance"] > 0) \
+		and _map_chunks.all(func(chunk): return (chunk.visibility_range_end > 0.0) == (expected["view_distance"] > 0) \
+			and chunk.visibility_range_end >= expected["view_distance"])
+
+## Self-test: the visible panels that overlap, e.g. "legend/chart"
+func _overlapping_panels() -> PackedStringArray:
+	var rects := occupancy_panel.panel_rects()
+	rects.merge(settings_panel.rects())
+	if replay_controls.visible:
+		rects["bar"] = replay_controls.bar_rect()
+	var names := rects.keys()
+	var found := PackedStringArray()
+	for i in names.size():
+		for j in range(i + 1, names.size()):
+			if rects[names[i]].intersects(rects[names[j]]):
+				found.append("%s/%s" % [names[i], names[j]])
+	return found
+
 ## Self-test: buses and stops match the lines hidden in the Lines panel. A bus is shown (and clickable) unless its line
-## is hidden; a stop is shown while one of its lines is
+## is hidden; a stop is shown while one of its lines is, unless "Other stops" is unchecked and it is not on the
+## highlighted line
 func _lines_consistent() -> bool:
 	for bus_3d in buses.values():
 		var hidden: bool = _hidden_routes.has(bus_3d.route_id)
 		if bus_3d.visible == hidden or (bus_3d.body.collision_layer == 0) != hidden:
 			return false
 	for stop in _stops:
-		if stop["node"].visible != stop["routes"].keys().any(func(stop_route): return not _hidden_routes.has(stop_route)):
+		var line_shown: bool = stop["routes"].keys().any(func(stop_route): return not _hidden_routes.has(stop_route))
+		var other_hidden: bool = not _other_stops_shown and _highlighted_stops > 0 and stop["node"].scale != STOP_HIGHLIGHT_SCALE
+		if stop["node"].visible != (line_shown and not other_hidden):
 			return false
 	return true
 
@@ -867,9 +1102,29 @@ func _finish_selftest() -> void:
 		if not _selftest_checks.get("layers_ok", false):
 			errors.append("The legend checkboxes failed: %s" % JSON.stringify(_selftest_checks.get("layers", {})))
 	var lines_ok := errors.size() == before_lines
+	# Display settings, the panels' layout and Hide UI
+	var before_display := errors.size()
+	if loaded:
+		var presets: Dictionary = _display_checks.get("presets", {})
+		if presets.is_empty() or not presets.values().all(func(applied): return applied):
+			errors.append("A display preset was not applied: %s" % JSON.stringify(presets))
+		if not (_display_checks.get("settings_saved", false) and _display_checks.get("crash_restart_lower", false) \
+				and _display_checks.get("normal_exit_kept", false)):
+			errors.append("The display settings were not saved or restored right: %s" % JSON.stringify(_display_checks))
+		if not _display_checks.get("overlaps", PackedStringArray(["not checked"])).is_empty():
+			errors.append("Panels overlap: %s" % ", ".join(_display_checks.get("overlaps", PackedStringArray(["not checked"]))))
+		var hide_ui: Dictionary = _display_checks.get("hide_ui", {})
+		if hide_ui.is_empty() or not hide_ui.values().all(func(passed): return passed):
+			errors.append("Hide UI failed: %s" % JSON.stringify(hide_ui))
+	var display_ok := errors.size() == before_display
+	# The map's collision puts the buses on the ground (ground_y in bus_3d.gd): a ray down at its center must hit it
+	var map_collision := is_over_map(_map_bounds().get_center())
+	if not map_collision:
+		errors.append("The map has no collision: the buses cannot be placed on the ground")
 	var logged := _selftest_logger.take()
 	errors.append_array(logged["errors"])
-	var ok: bool = loaded and _frames_emitted >= 3 and not buses.is_empty() and occupancy_ok and lines_ok and logged["script_errors"] == 0
+	var ok: bool = loaded and _frames_emitted >= 3 and not buses.is_empty() and occupancy_ok and lines_ok and display_ok \
+		and map_collision and logged["script_errors"] == 0
 
 	var found: Array = []
 	for entry in replay_entries:
@@ -891,6 +1146,7 @@ func _finish_selftest() -> void:
 		"buses_on_map": count_buses_on_map(),
 		"max_buses_on_map": _max_buses_on_map,
 		"view_framed": _view_framed,
+		"map_collision": map_collision,
 		"shot": _shot_saved,
 		"buses_with_occupancy": buses_with_occupancy,
 		"occupancy_in_replay": occupancy_data.occupancy_known,
@@ -911,7 +1167,11 @@ func _finish_selftest() -> void:
 		"chart_rows": _chart_stats.get("rows", []),
 		"legend": _chart_stats.get("legend", []),
 		"lines": _selftest_checks,
+		"display": _display_checks,
+		"quality_preset": quality.preset,
+		"renderer": "%s (%s)" % [RenderingServer.get_current_rendering_method(), RenderingServer.get_video_adapter_name()],
 		"shot_chart": _shot_chart_saved,
+		"shot_settings": _shot_settings_saved,
 		"script_errors": logged["script_errors"],
 		"errors": errors,
 		"godot_version": Engine.get_version_info()["string"],

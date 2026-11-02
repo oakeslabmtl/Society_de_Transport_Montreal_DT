@@ -66,9 +66,6 @@ image = SubResource("Image_657gy")
 resource_local_to_scene = true
 render_priority = 0
 shader = ExtResource("3_7mv6y")
-shader_parameter/normal_threshold = 0.1
-shader_parameter/depth_threshold = 0.05
-shader_parameter/depth_artifact_correction_coef = 2.0
 shader_parameter/outline_color = Color(0.97, 0.97, 0.97, 1)
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_6e2dp"]

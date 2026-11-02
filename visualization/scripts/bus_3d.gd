@@ -3,6 +3,7 @@ extends Node3D
 class_name  Bus3D
 
 const Occupancy = preload("res://scripts/occupancy.gd")
+const DEFAULT_OUTLINE := Color(0.97, 0.97, 0.97)
 
 @export var ray_length : float = 20000.0  # Length of the ray
 @export var outline_color : Color
@@ -30,7 +31,11 @@ var t = 0.0
 static var playback_speed := 1.0
 
 func _ready() -> void:
-	original_outline_color = bus_mesh.get_surface_override_material(0).next_pass.get_shader_parameter("outline_color")
+	var outline = bus_mesh.get_surface_override_material(0).next_pass.get_shader_parameter("outline_color")
+	original_outline_color = outline if outline is Color else DEFAULT_OUTLINE
+	# The beacon and the ghost are markers: their shadows would streak across the city
+	$marker.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	ghost_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	# The selected bus's outline has the color of its chart; the outline shader is unshaded: undo the tonemapping
 	outline_color = Occupancy.screen_albedo(Occupancy.SELECTED_COLOR)
 	_collision_layer = body.collision_layer
@@ -73,6 +78,11 @@ func set_occupancy(status: int) -> void:
 	occupancy_status = status
 	$marker.material_override = Occupancy.material(status)
 
+## Display quality (quality.gd): the two headlights
+func set_headlights(shown: bool) -> void:
+	$SpotLight3D.visible = shown
+	$SpotLight3D2.visible = shown
+
 ## Hides the bus (line filter) and makes it unclickable: the camera's click raycast would still hit its body
 func set_filtered_out(hidden: bool) -> void:
 	if hidden == filtered_out:
@@ -107,12 +117,14 @@ func _on_selected():
 	selected = true
 	var mat = bus_mesh.get_surface_override_material(0).next_pass
 	print("Object Selected: ", name)
-	# Change material or highlight the object
+	# Change material or highlight the object (the outline is also thicker)
 	if mat:
 		mat.set_shader_parameter("outline_color", outline_color)
+		mat.set_shader_parameter("outline_width", 2)
 
 func _on_unselected():
 	selected = false
 	var mat = bus_mesh.get_surface_override_material(0).next_pass
 	if mat:
 		mat.set_shader_parameter("outline_color", original_outline_color)
+		mat.set_shader_parameter("outline_width", 1)

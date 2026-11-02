@@ -1,17 +1,21 @@
 extends Control
 
-## Replay transport bar (built in code), anchored to the bottom of the screen.
-## In live mode only the mode badge is shown.
+## Replay transport bar (built in code), anchored to the bottom of the screen: one row (recording, Restart, Play, speed,
+## timeline, then the recording's local time and the position in it), and a second one only while there is a message.
+## In live mode only the LIVE badge is shown.
 
 signal replay_selected(path: String)
+signal layout_changed() # The bar's size changed (the settings panel stays above it)
 
 const SPEEDS := [1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
 const PANEL_COLOR := Color(0.08, 0.08, 0.08, 0.66)
-const REPLAY_COLOR := Color(0.85, 0.5, 0.05)
 const LIVE_COLOR := Color(0.1, 0.6, 0.25)
 const ERROR_COLOR := Color(1.0, 0.45, 0.4)
 const INFO_COLOR := Color(0.85, 0.85, 0.85)
 const MARGIN := 16
+const TIME_FONT_SIZE := 13
+const TIME_SAMPLE := "Wed 0000-00-00 00:00:00 · 00:00 / 00:00" # Widest clock text: the timeline does not jitter
+const SHORT_TIME_SAMPLE := "00:00:00 · 00:00 / 00:00" # Without the date, when the row would not fit the window
 
 var player: Node = null
 var live := false
@@ -29,6 +33,8 @@ var _replay_widgets: Array[Control] = []
 var _paths: Array[String] = []
 var _dragging := false
 var _pending_seek := -1.0 # Timeline value to seek to while dragging (applied once per frame)
+var _clock_widths := Vector2.ZERO # Of TIME_SAMPLE and SHORT_TIME_SAMPLE
+var _short_clock := false
 
 func _init() -> void:
 	name = "ReplayControls"
@@ -37,6 +43,10 @@ func _init() -> void:
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(PRESET_FULL_RECT)
+	var font := _time_label.get_theme_font("font")
+	for i in 2:
+		_clock_widths[i] = ceilf(font.get_string_size([TIME_SAMPLE, SHORT_TIME_SAMPLE][i], HORIZONTAL_ALIGNMENT_LEFT, -1, TIME_FONT_SIZE).x)
+	resized.connect(_relayout)
 	_relayout()
 
 func setup(replay_player: Node) -> void:
@@ -57,11 +67,10 @@ func _process(_delta: float) -> void:
 
 func set_live(is_live: bool) -> void:
 	live = is_live
-	_badge.text = " LIVE " if live else " REPLAY "
-	var badge_style: StyleBoxFlat = _badge.get_theme_stylebox("normal")
-	badge_style.bg_color = LIVE_COLOR if live else REPLAY_COLOR
+	_badge.visible = live
 	for widget in _replay_widgets:
 		widget.visible = not live
+	_message_label.visible = not live and _message_label.text != ""
 	_relayout()
 
 func set_replays(entries: Array, selected_path: String) -> void:
@@ -87,10 +96,16 @@ func set_replays(entries: Array, selected_path: String) -> void:
 		if _replay_list.selected < 0:
 			_replay_list.text = "Choose a recording"
 
+## Screen rectangle of the bar (self-test: the panels must not overlap it)
+func bar_rect() -> Rect2:
+	return _bar.get_global_rect()
+
+## A message on a second row ("" removes the row)
 func show_message(text: String, is_error := false) -> void:
 	_message_label.text = text
 	_message_label.tooltip_text = text
 	_message_label.add_theme_color_override("font_color", ERROR_COLOR if is_error else INFO_COLOR)
+	_message_label.visible = not live and text != ""
 	_relayout()
 
 func _build() -> void:
@@ -113,12 +128,14 @@ func _build() -> void:
 	row.add_theme_constant_override("separation", 8)
 	rows.add_child(row)
 
+	# Live mode's only content
 	_badge = Label.new()
-	_badge.text = " REPLAY "
+	_badge.text = " LIVE "
 	_badge.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	_badge.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_badge.visible = false
 	var badge_style := StyleBoxFlat.new()
-	badge_style.bg_color = REPLAY_COLOR
+	badge_style.bg_color = LIVE_COLOR
 	badge_style.set_content_margin_all(4)
 	badge_style.set_corner_radius_all(3)
 	_badge.add_theme_stylebox_override("normal", badge_style)
@@ -167,24 +184,23 @@ func _build() -> void:
 	_timeline.drag_ended.connect(_on_drag_ended)
 	_add_replay_widget(row, _timeline)
 
-	# Second row: messages on the left, the clock on the right (below the end of the timeline)
-	var info_row := HBoxContainer.new()
-	info_row.add_theme_constant_override("separation", 8)
-	rows.add_child(info_row)
-	_replay_widgets.append(info_row)
+	# The recording's local time and the position in it, at the end of the row
+	_time_label = Label.new()
+	_time_label.text = "--"
+	_time_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_time_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_time_label.add_theme_font_size_override("font_size", TIME_FONT_SIZE)
+	_time_label.add_theme_color_override("font_color", INFO_COLOR)
+	_add_replay_widget(row, _time_label)
 
-	# Single line (autowrap would make the bar's minimum height depend on its width)
+	# Second row, only while there is a message. Single line (autowrap would make the bar's minimum height depend on its
+	# width)
 	_message_label = Label.new()
 	_message_label.clip_text = true
 	_message_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	_message_label.mouse_filter = Control.MOUSE_FILTER_PASS
-	_message_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	info_row.add_child(_message_label)
-
-	_time_label = Label.new()
-	_time_label.text = "--"
-	_time_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	info_row.add_child(_time_label)
+	_message_label.visible = false
+	rows.add_child(_message_label)
 
 func _add_replay_widget(row: HBoxContainer, widget: Control) -> void:
 	widget.focus_mode = Control.FOCUS_NONE
@@ -194,6 +210,13 @@ func _add_replay_widget(row: HBoxContainer, widget: Control) -> void:
 func _relayout() -> void:
 	if not is_inside_tree():
 		return
+	# In a narrow window the clock drops the date, so the row still fits
+	_time_label.custom_minimum_size.x = _clock_widths.x
+	_short_clock = not live and _bar.get_combined_minimum_size().x > size.x - 2 * MARGIN
+	if _short_clock:
+		_time_label.custom_minimum_size.x = _clock_widths.y
+	if player != null:
+		_update_time_label()
 	# Re-anchor after content changes so the bar keeps hugging the bottom edge
 	_bar.reset_size()
 	if live:
@@ -201,6 +224,7 @@ func _relayout() -> void:
 	else:
 		_bar.set_anchors_and_offsets_preset(PRESET_BOTTOM_WIDE, PRESET_MODE_MINSIZE, MARGIN)
 	_bar.grow_vertical = GROW_DIRECTION_BEGIN
+	layout_changed.emit()
 
 func _select_path(path: String) -> void:
 	var index := _paths.find(path)
@@ -208,7 +232,10 @@ func _select_path(path: String) -> void:
 		_replay_list.select(index)
 
 func _update_time_label() -> void:
-	_time_label.text = "%s   %s / %s" % [player.get_clock_text(), player.format_mmss(player.get_display_time()), player.format_mmss(player.duration)]
+	var clock: String = player.get_clock_text()
+	if _short_clock and clock.length() > 8:
+		clock = clock.right(8) # The time of day
+	_time_label.text = "%s · %s / %s" % [clock, player.format_mmss(player.get_display_time()), player.format_mmss(player.duration)]
 
 func _refresh_buttons() -> void:
 	var has_replay: bool = player != null and player.has_frames()

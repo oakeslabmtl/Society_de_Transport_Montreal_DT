@@ -104,12 +104,14 @@ The 3D model covers downtown Montréal only (roughly latitude 45.48 to 45.53, lo
   - Godot 4.7.1 .NET. The script finds `Godot_v4.7.1-stable_mono_win64_console.exe` on the Desktop, in Downloads, in Program Files or on the `PATH`. Otherwise, give its path: `powershell -ExecutionPolicy Bypass -File build_demo.ps1 -Godot "<path>"`, or save it once with `setx GODOT_BIN "<path>"`, then open a new terminal or double-click `build_demo.bat` again.
   - Its export templates (in Godot: Editor > Manage Export Templates).
   - The .NET SDK 8 or newer. The .NET runtime alone is not enough.
-- Result: `visualization/Build/STM-DT-Demo.zip` (about 365 MB, 500 MB unzipped). The unzipped version is in `visualization/Build/Demo/`, so you can try it directly. Build output and its log (`visualization/Build/build_demo.log`) are not tracked by git.
+- Result: `visualization/Build/STM-DT-Demo.zip` (about 290 MB, 425 MB unzipped). The unzipped version is in `visualization/Build/Demo/`, so you can try it directly. Build output and its log (`visualization/Build/build_demo.log`) are not tracked by git.
 - To use the zip:
   1. Unzip it (right-click > Extract All).
   2. Double-click `STM DT Demo.exe`. Keep `data_Below MTL_windows_x86_64` (the bundled .NET runtime) and `replays` next to it.
   3. If Windows SmartScreen warns about an unknown app, click "More info" > "Run anyway". The exe is not signed.
-- Top left: the legend (with checkboxes for the bus stops and the reference points), the **Lines** panel and, once you click a bus, its occupancy chart. Bottom bar: replay menu, Restart, Play/Pause, speed (1x to 60x), timeline, and the local time of the recording.
+- Top left: the **Lines** panel and, once you click a bus, its occupancy chart. Top right: the toolbar (**Legend**, **Settings**, **Hide UI**) and the legend, with checkboxes for the bus stops and the reference points. Bottom bar, one row: replay menu, Restart, Play/Pause, speed (1x to 60x), timeline, then the local time of the recording and the position in it (a second row shows only for a message, e.g. a replay that could not be read).
+- **Hide UI** (or the H key) hides every panel, for a clean view of the city. Move the mouse to see a **Show UI** button at the top right, or press H again.
+- On a computer where the demo does not start, or stays slow even at a low quality, double-click `Start in safe mode.bat` next to the exe. It uses the OpenGL renderer and the Minimum quality for that run (see [Display quality](#display-quality-and-slower-computers)).
 - Finding the buses: in replay mode the camera starts over the busiest group of buses on the map. In the bundled hour, about 55 of the roughly 95 buses in service at any moment are on the 3D map. The others are on parts of their routes outside the model (routes 55 and 80, for example, run far north of it). To reach them, right-click for free-fly and move with WASD (Space and Ctrl to go up and down); right-click again to get the cursor back.
 
 ### Record a new hour
@@ -158,7 +160,7 @@ Copy an exported `.json` into the `replays` folder next to `STM DT Demo.exe` in 
 ### Occupancy colors, chart and forecasts
 
 - Each bus's beacon is colored by its occupancy: the GTFS-realtime [`OccupancyStatus`](https://gtfs.org/documentation/realtime/reference/#enum-occupancystatus) of the feed, named with the spec's wording. The colors go from green to red: dark green for many seats available, yellow for few seats available, orange for standing room only, dark red for full, and grey for no data. Each color also has its own lightness, so color-blind viewers can still tell them apart.
-- The spec has nine statuses. Six of them, from `EMPTY` (0) to `FULL` (5), say how full the bus is: the viewer charts and forecasts those. `NOT_ACCEPTING_PASSENGERS` (6) and `NOT_BOARDABLE` (8) are shown on the bus in purple but not charted or forecast; `NO_DATA_AVAILABLE` (7) and a missing status are "no data". The spec also says a feed may publish only some statuses and that consumers must not assume they follow a linear scale. STM sends only four: many seats available, few seats available, standing room only and full (values 1, 2, 3 and 5). It never sends empty (0) or crushed standing room only (4). The legend at the top left and the chart therefore list only the statuses found in the data. The legend's two checkboxes show or hide the teal bus-stop poles and the blue reference points, which are not buses. The reference points (the poles of known coordinates that place the buses on the 3D map) are hidden at start.
+- The spec has nine statuses. Six of them, from `EMPTY` (0) to `FULL` (5), say how full the bus is: the viewer charts and forecasts those. `NOT_ACCEPTING_PASSENGERS` (6) and `NOT_BOARDABLE` (8) are shown on the bus in purple but not charted or forecast; `NO_DATA_AVAILABLE` (7) and a missing status are "no data". The spec also says a feed may publish only some statuses and that consumers must not assume they follow a linear scale. STM sends only four: many seats available, few seats available, standing room only and full (values 1, 2, 3 and 5). It never sends empty (0) or crushed standing room only (4). The legend at the top right and the chart therefore list only the statuses found in the data. The legend's checkboxes show or hide the teal bus-stop poles (while a bus is selected, also the other stops on their own) and the blue reference points, which are not buses. The reference points (the poles of known coordinates that place the buses on the 3D map) are hidden at start.
 - Click a bus to open its chart: one row per status, its occupancy over the last 20 minutes and, when the replay has a forecast, the next 10 minutes (dashed median and its 80% range). In a replay, **Show actual** draws what really happened next. Close the chart with **×**. The selected bus has a blue outline, the color of its chart. Clicking another bus selects it instead. In a replay, a bus the feed skips for up to 3 polls in a row (45 s) stays where it was, so it stays selected; after that, or at once after a jump on the timeline, it is removed until it reports again.
 - The forecasts are made with [Timestral](https://github.com/mistralai/timestral), a time-series model by Mistral AI, and stored in the replay file in advance: the demo exe runs no model and needs no Python. Every minute of replay time, each bus with at least 2 minutes of occupancy history gets a forecast of the next 10 minutes (a point every 30 s), made only from what was observed until then. The model works on the ranks of the statuses found, not on their values: for STM, many seats available is step 0 and full is step 3. That scale is the statuses found in the whole replay.
 - Each forecast is then **calibrated walk-forward**: before each forecast time, every forecast point (+30 s to +10 min) learns from the earlier forecasts whose outcome is already known, never from the future. Two things are learned, both easy to explain:
@@ -229,16 +231,53 @@ The question: could correlations between buses, or where a bus is, predict its o
 
 ### Lines and their stops
 
-- **Lines** (under the legend) has one button per line: filled while its buses and stops are shown, outlined while they are hidden.
+- **Lines** (top left) has one button per line: filled while its buses and stops are shown, outlined while they are hidden.
   - Click a line to hide it, click again to show it. Double-click a line to show only that one, and **All** shows every line again.
   - To add a line, type its number in the **+ line** field and press Enter (several at once: `24, 51`). In a replay, only the recorded lines can be added; another number gets a note ("Line 45 is not in this recording"). Live, a line shows buses only if the ingestion service publishes it: `python -m startup.start_data_ingestion_service` (from `software`) publishes every route, or only the routes given on its command line (e.g. `121,45,41`).
   - A selected bus whose line gets hidden is released.
 - The poles are the bus stops of the shown lines, in both directions. When a bus is selected, the stops of its line in its direction of travel become thicker, and the other stops fade. The legend names that line and its direction, e.g. "Stops of route 165 (Nord)". The highlight follows the bus when it turns around at a terminus.
+  - Uncheck **Other stops** in the legend to hide, while a bus is selected, every stop that is not on its line and direction; they come back when no bus is selected. Unchecking the line's own stops hides every stop.
 - The stops come from `visualization/assets/route_stops.json`. It lists, for every STM bus route and direction, the stops of all its trips (branches and short turns included). It is made from the GTFS files in `datasets\` (STM schedule of 2025) with:
   ```
   python software\recording route-stops
   ```
   To refresh it, download STM's current GTFS (`gtfs_stm.zip` on stm.info) and run `python software\recording route-stops --gtfs <path to gtfs_stm.zip or its folder>`, then rebuild the demo. With the 2025 files, 89 to 100% of the stops reported by the buses of the bundled hour (October 2026) are on their line's list. It takes 10 to 45 seconds. The live feed's trip ids change with each schedule, so the viewer matches a bus to its stops by route and direction.
+
+### Display quality and slower computers
+
+**Settings** (top right) sets how the city is drawn. A preset sets everything at once; changing one setting makes it "Custom". The choice is saved in `%APPDATA%\Godot\app_userdata\STM DT\settings.cfg` (the editor and the demo share it). Distances are real ones: one unit of the 3D scene is about 5.3 m (the reference points: 599 units for 3.19 km).
+
+| Preset | Shadows | View distance | Resolution | Other |
+|---|---|---|---|---|
+| Minimum | off | 2.7 km | 60% | no glow, no headlights |
+| Low | 2 levels, 1.3 km | 4.3 km | 75% | no glow, no headlights |
+| Medium | 2 levels, 2.1 km | whole city | 100% | no headlights |
+| High | 4 levels, 3.2 km | whole city | 100% | |
+| Ultra | 4 levels, 5.3 km, softer | whole city | 100% | MSAA 4x, ambient occlusion |
+
+- The first start picks a preset from the GPU: High on a dedicated GPU, Medium on an integrated one, Low on the OpenGL renderer, Minimum on a software or virtual GPU. It then measures the frame rate for a few seconds (not while the window is minimized) and lowers the preset, one step at a time, while the view runs below 24 frames per second (a note says so).
+- The exported demo restarts lower after a run that did not end normally (a crash, or a killed process): at Low, or at Minimum if it was already at Low or lower (Custom settings count as their shadows' level), with a note. Closing the window is a normal end. Runs from the Godot editor neither check nor change this.
+- `--quality=<minimum|low|medium|high|ultra>` after `--` on the command line uses that preset for one run without saving anything. `Start in safe mode.bat` adds the OpenGL renderer (`--rendering-driver opengl3 --rendering-method gl_compatibility`): for a computer whose Vulkan or Direct3D 12 driver fails, or that has no GPU driver. Godot already falls back to Direct3D 12, then OpenGL, when Vulkan is missing.
+- On the OpenGL renderer (the Compatibility renderer), ambient occlusion is not available, and the reduced resolution is plain upscaling instead of FSR.
+- With a view distance, a haze of the horizon's color hides where the city stops. The occupancy beacons and the stops stay visible through it.
+
+What it costs, in milliseconds of GPU time per frame at 1920x1080 for the bundled replay (fewer is better: 33 ms is 30 frames per second, 17 ms is 60). "Before" is the viewer before these settings: 4 shadow levels to 5.3 km, detailed outlines, the whole city, and the original (not yet welded) map; the presets are measured with the welded map. The start view is the replay's first view, about 320 m from the buses; the overview shows the whole city from about 2.4 km.
+
+| GPU, view | Before | Minimum | Low | Medium | High | Ultra |
+|---|---|---|---|---|---|---|
+| Intel UHD (integrated), start view | 28.6 | 5.1 | 7.8 | 11.2 | 17.4 | 33.3 |
+| Intel UHD, overview | 55.3 | 7.3 | 12.8 | 19.4 | 26.8 | 61.4 |
+| RTX 4060 Laptop, start view | 4.3 | 0.8 | 1.2 | 1.9 | 2.8 | 5.1 |
+| RTX 4060 Laptop, overview | 8.1 | 1.1 | 2.2 | 3.4 | 4.7 | 8.6 |
+
+On the CPU alone (Windows' software renderer, no GPU), Minimum runs the viewer's whole self-test; with the "Before" settings it did not draw a frame per second.
+
+What we learned (for students):
+- **The city is the cost.** Its 3D model has 5.4 million triangles in 1,327 pieces. The sun's shadows draw it again for each level of shadow detail: in the start view (before the welding below), 12 million triangles per frame with 4 levels to 5.3 km, 1.2 million without shadows. Shorter shadow distances keep the shadows near the camera, where they matter.
+- **The bus outlines** used to compare the normal of each pixel with its neighbors', which makes the whole city write its normals: 5.8 ms (start view) and 15.3 ms (overview) on the Intel GPU, 0.4 and 1.4 ms on the RTX. They now use depth only: a bus pixel is outlined where a neighbor is clearly further away (its silhouette), which costs almost nothing and works with every renderer.
+- **View distance** saves the most in wide views: drawing only the city within 2.1 km of the camera (other settings unchanged, before the welding below) took the Intel GPU's overview from 55 to 18 ms.
+- **The map is welded.** Its 3D model was a "triangle soup": almost every triangle had its own three vertices (15.7 million vertices for 5.4 million triangles), so the GPU did 4.6 times the vertex work and the engine could not simplify far away pieces. `software/tools/weld_map.py` made it share its vertices (3.4 million, the same triangles bit for bit) and the file went from 535 to 75 MB. Its shader (`visualization/assets/map_flat.gdshader`) computes each triangle's flat normal per pixel, so it looks as before. With the same settings, the Intel GPU takes 16 to 44% less time per frame (Medium: 15.9 to 11.2 ms in the start view, 29.4 to 19.4 in the overview), and the city takes about 350 MB less GPU memory (740 to 400 MB). The speed-up comes from the welding itself: the map now has simpler versions of its pieces for far away (1,716 levels of detail), but at the engine's default threshold (1 pixel of error) these views hardly use them, and a coarser threshold drew 15% fewer triangles for at most 6% less GPU time, so it is no setting. The map's collision, which puts the buses on the ground, is unchanged: the same 5.4 million triangles, and every bus at the same height to the last digit.
+- The bus stop and reference-point poles, the occupancy beacons and the buses' "ghosts" no longer cast shadows (they are markers: their shadows streaked across the city).
 
 ### Notes
 

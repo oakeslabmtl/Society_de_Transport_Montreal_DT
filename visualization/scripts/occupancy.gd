@@ -79,13 +79,15 @@ static func set_environment(environment: Environment) -> void:
 	_update_materials()
 
 ## Beacon material of a status: unshaded and opaque, one cached instance per status. Its albedo is the inverse of the
-## scene's tonemapping, so the beacon shows the legend color on screen
+## scene's tonemapping, so the beacon shows the legend color on screen. The view-distance haze does not cover it: far
+## buses stay visible
 static func material(status: int) -> StandardMaterial3D:
 	_update_materials()
 	var key := status if status >= 0 and status < COLORS.size() else NO_DATA
 	if not _materials.has(key):
 		var mat := StandardMaterial3D.new()
 		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.disable_fog = true
 		mat.albedo_color = screen_albedo(color(key))
 		_materials[key] = mat
 	return _materials[key]

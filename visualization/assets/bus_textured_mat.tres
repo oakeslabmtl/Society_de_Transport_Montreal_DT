@@ -30,9 +30,6 @@ image = SubResource("Image_ix7wk")
 resource_local_to_scene = true
 render_priority = 0
 shader = ExtResource("1_j0skd")
-shader_parameter/normal_threshold = 0.1
-shader_parameter/depth_threshold = 0.05
-shader_parameter/depth_artifact_correction_coef = 2.0
 shader_parameter/outline_color = Color(0.92, 0.674667, 0, 1)
 
 [resource]

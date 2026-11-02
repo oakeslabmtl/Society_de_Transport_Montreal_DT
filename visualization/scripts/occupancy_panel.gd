@@ -1,14 +1,15 @@
 extends Control
 
-## The top-left column: the legend (occupancy colors, and checkboxes for the scene's stop and reference-point poles),
-## the Lines panel (show or hide each line, add one by number) and the chart of the selected bus: its observed occupancy,
-## the precomputed forecast (dashed median and range) and, in replays, optionally what really happened.
+## The legend, a column at the top right under the toolbar (occupancy colors, and checkboxes for the scene's stop and
+## reference-point poles), and the top-left column: the Lines panel (show or hide each line, add one by number) and the
+## chart of the selected bus: its observed occupancy, the precomputed forecast (dashed median and range) and, in
+## replays, optionally what really happened.
 ## Built in code like replay_controls.gd; main.gd feeds it the selected bus and the clock.
 
 signal close_requested()
 signal lines_hidden_changed(hidden: PackedStringArray) # Lines whose buses and stops are hidden; empty = all shown
 signal lines_added(routes: PackedStringArray) # Route numbers typed in the Lines panel's field
-signal layer_toggled(layer: String, shown: bool) # "stops" or "references"
+signal layer_toggled(layer: String, shown: bool) # "stops", "other_stops" (while a line is highlighted) or "references"
 
 const Occupancy = preload("res://scripts/occupancy.gd")
 const LEGEND_COLOR := Color(0.08, 0.08, 0.08, 0.66) # Same surface as the replay bar
@@ -31,7 +32,7 @@ const CHIP_BORDER := Color("#5c5b56")
 const CHIP_ON_TEXT := Color("#141413")
 const MARGIN := 16
 const PADDING := 8
-const LEGEND_SEPARATION := 12
+const LEGEND_WIDTH := 210 # The line's name changes with the selected bus: a longer one ends with "…", the column stays
 const CHART_SIZE := Vector2(500, 280) # Narrower in a narrow window
 const AXIS_FONT_SIZE := 11
 const PAST_SECONDS := 1200.0 # Shown before now
@@ -76,14 +77,18 @@ var _metrics_version := -1
 var _label_column := 0.0
 var _hidden := {} # route -> true: lines whose buses and stops are hidden
 
+var _right_top := float(MARGIN) # Top of the legend column (under the toolbar, set_right_column)
+var _right_reserved := 0.0 # Width of the right column's widest panel (toolbar, settings): the left column keeps clear
+var _settings_open := false # In a window too narrow for the chart beside the settings, the chart waits until they close
+
 var _legend: PanelContainer
-var _legend_flow: HFlowContainer
+var _status_rows: VBoxContainer
 var _status_items: Array[Control] = []
-var _markers: HBoxContainer
-var _line_stop_item: HBoxContainer
-var _line_stop_label: Label
-var _stop_check: CheckBox
+var _stop_check: CheckBox # All the stops, or the highlighted line's (then "Other stops" shows)
+var _other_check: CheckBox
 var _reference_check: CheckBox
+var _stop_icon: ImageTexture
+var _line_stop_icon: ImageTexture
 var _lines: PanelContainer
 var _lines_flow: HFlowContainer
 var _all_button: Button
@@ -130,15 +135,33 @@ func _input(event: InputEvent) -> void:
 		_add_field.release_focus()
 
 ## Sets the legend's stop and reference-point checkboxes to what the scene shows. line_stops: what the highlighted stops
-## are (e.g. "Stops of route 51 (Nord)"), "" when no line is highlighted; the other stops are then faded
-func set_marker_legend(stops_visible: bool, references_visible: bool, line_stops := "") -> void:
-	var highlighted := stops_visible and line_stops != ""
-	_line_stop_item.visible = highlighted
-	_line_stop_label.text = line_stops
+## are (e.g. "Stops of route 51 (Nord)"), "" when no line is highlighted. While one is, the first checkbox is that line's
+## stops (unchecked: no stop at all) and "Other stops" shows or hides the faded stops that are not on that line and
+## direction
+func set_marker_legend(stops_visible: bool, other_stops_visible: bool, references_visible: bool, line_stops := "") -> void:
+	var highlighted := line_stops != ""
 	_stop_check.set_pressed_no_signal(stops_visible)
-	_stop_check.text = "Other stops" if highlighted else "Bus stops"
-	_stop_check.icon = _swatch_texture(OTHER_STOP_COLOR if highlighted else STOP_COLOR)
+	_stop_check.text = line_stops if highlighted else "Bus stops"
+	_stop_check.icon = _line_stop_icon if highlighted else _stop_icon
+	_stop_check.tooltip_text = "%s\nShow or hide every bus stop (this line's and the others)" % line_stops if highlighted \
+		else "Show or hide the bus stops of the lines shown"
+	_other_check.visible = highlighted
+	_other_check.set_pressed_no_signal(other_stops_visible)
+	_other_check.disabled = not stops_visible
 	_reference_check.set_pressed_no_signal(references_visible)
+	_relayout()
+
+## Top of the legend column (under the toolbar) and the right column's width: the left column keeps clear of them
+func set_right_column(top: float, reserved_width: float) -> void:
+	_right_top = top
+	_right_reserved = reserved_width
+	_relayout()
+
+## The legend shows unless the user hid it, or the settings panel takes its place. settings_open: in a window too
+## narrow for the chart beside the settings, the chart waits until they close
+func set_legend_shown(shown: bool, settings_open := false) -> void:
+	_legend.visible = shown
+	_settings_open = settings_open
 	_relayout()
 
 ## One button per line (ascending numbers); names: route -> long name (tooltips). Lines still listed stay hidden
@@ -151,7 +174,7 @@ func set_routes(routes: PackedStringArray, names := {}) -> void:
 	sorted_routes.sort_custom(func(a, b): return a.to_int() < b.to_int() if a.to_int() != b.to_int() else a < b)
 	var index := _all_button.get_index() + 1
 	for route in sorted_routes:
-		var button := _make_chip(route)
+		var button := make_chip(route)
 		var long_name: String = names.get(route, "")
 		button.tooltip_text = "Route %s%s\nClick: show or hide this line. Double-click: only this line." % [route, " · " + long_name if long_name != "" else ""]
 		button.pressed.connect(_toggle_line.bind(route))
@@ -200,9 +223,17 @@ func submit_line_text(text: String) -> void:
 	_add_field.text = text
 	_add_field.text_submitted.emit(text)
 
-## The legend checkbox of a layer: "stops" or "references" (self-test)
+## The legend checkbox of a layer: "stops", "other_stops" or "references" (self-test)
 func layer_check(layer: String) -> CheckBox:
-	return _stop_check if layer == "stops" else _reference_check
+	return {"stops": _stop_check, "other_stops": _other_check}.get(layer, _reference_check)
+
+## Screen rectangles of the legend, the Lines panel and the chart when shown (self-test: they must not overlap)
+func panel_rects() -> Dictionary:
+	var rects := {}
+	for panel: Control in [_legend, _lines, _chart]:
+		if panel.is_visible_in_tree():
+			rects[String(panel.name).to_lower()] = panel.get_global_rect()
+	return rects
 
 ## The note under the line buttons (self-test)
 func lines_note() -> String:
@@ -265,40 +296,44 @@ func legend_labels() -> PackedStringArray:
 	return labels
 
 func _build() -> void:
-	# Legend strip: display only, clicks go through to the 3D view. It wraps onto more lines in narrow windows
-	_legend = _make_panel(LEGEND_COLOR)
+	# Legend column: the occupancy colors (one row each, _sync_statuses), then the scene's other colored poles
+	_legend = make_panel(LEGEND_COLOR)
 	_legend.name = "Legend"
+	_legend.custom_minimum_size.x = LEGEND_WIDTH
 	add_child(_legend)
-	_legend_flow = HFlowContainer.new()
-	_legend_flow.add_theme_constant_override("h_separation", LEGEND_SEPARATION)
-	_legend_flow.add_theme_constant_override("v_separation", 4)
-	_legend.add_child(_legend_flow)
-	_legend_flow.add_child(_make_label("Bus occupancy", 13, INK_PRIMARY))
-	# The status entries are inserted here (_sync_statuses), then the scene's other colored poles, set apart from the
-	# occupancy colors (one flow item: they wrap together)
-	_markers = HBoxContainer.new()
-	_markers.add_theme_constant_override("separation", LEGEND_SEPARATION)
-	_markers.add_child(VSeparator.new())
-	_line_stop_item = _make_legend_item(STOP_COLOR, "", true)
-	_line_stop_label = _line_stop_item.get_child(1) as Label
-	_line_stop_item.visible = false
-	_markers.add_child(_line_stop_item)
-	_stop_check = _make_layer_check("Bus stops", STOP_COLOR, "Show or hide the bus stops of the lines shown")
+	var legend_rows := VBoxContainer.new()
+	legend_rows.add_theme_constant_override("separation", 2)
+	_legend.add_child(legend_rows)
+	legend_rows.add_child(make_label("Bus occupancy", 13, INK_PRIMARY))
+	_status_rows = VBoxContainer.new()
+	_status_rows.add_theme_constant_override("separation", 2)
+	legend_rows.add_child(_status_rows)
+	legend_rows.add_child(HSeparator.new())
+	_stop_icon = _swatch_texture(STOP_COLOR)
+	_line_stop_icon = _swatch_texture(STOP_COLOR, true)
+	_stop_check = make_check("Bus stops", _stop_icon, "Show or hide the bus stops of the lines shown")
+	_stop_check.clip_text = true
+	_stop_check.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	_stop_check.toggled.connect(func(on: bool): layer_toggled.emit("stops", on))
-	_markers.add_child(_stop_check)
-	_reference_check = _make_layer_check("Reference points", REFERENCE_COLOR,
+	legend_rows.add_child(_stop_check)
+	_other_check = make_check("Other stops", _swatch_texture(OTHER_STOP_COLOR),
+		"Show or hide the stops that are not on the selected bus's line and direction (faded)")
+	_other_check.toggled.connect(func(on: bool): layer_toggled.emit("other_stops", on))
+	_other_check.visible = false
+	legend_rows.add_child(_other_check)
+	_reference_check = make_check("Reference points", _swatch_texture(REFERENCE_COLOR),
 		"Show or hide the reference points: the poles of known coordinates that place the buses on the 3D map")
 	_reference_check.toggled.connect(func(on: bool): layer_toggled.emit("references", on))
-	_markers.add_child(_reference_check)
-	_legend_flow.add_child(_markers)
-	# Display only, clicks go through to the 3D view, except on the two checkboxes
+	legend_rows.add_child(_reference_check)
+	# Clicks on the legend stay there (a near miss on a checkbox must not reach the 3D view: that releases the bus)
 	_ignore_mouse(_legend)
-	_stop_check.mouse_filter = MOUSE_FILTER_STOP
-	_reference_check.mouse_filter = MOUSE_FILTER_STOP
+	_legend.mouse_filter = MOUSE_FILTER_STOP
+	for check: CheckBox in [_stop_check, _other_check, _reference_check]:
+		check.mouse_filter = MOUSE_FILTER_STOP
 
 	# Lines: one button per line, shown (filled) or hidden (outlined), and a field to add one. Clicks on the panel must
 	# not reach the 3D view (a click there deselects the bus)
-	_lines = _make_panel(LEGEND_COLOR)
+	_lines = make_panel(LEGEND_COLOR)
 	_lines.name = "Lines"
 	_lines.mouse_filter = MOUSE_FILTER_STOP
 	_lines.mouse_force_pass_scroll_events = false # The wheel over the panel must not zoom the camera
@@ -307,10 +342,10 @@ func _build() -> void:
 	_lines_flow.add_theme_constant_override("h_separation", 6)
 	_lines_flow.add_theme_constant_override("v_separation", 4)
 	_lines.add_child(_lines_flow)
-	var lines_label := _make_label("Lines", 13, INK_PRIMARY)
+	var lines_label := make_label("Lines", 13, INK_PRIMARY)
 	lines_label.mouse_filter = MOUSE_FILTER_IGNORE
 	_lines_flow.add_child(lines_label)
-	_all_button = _make_chip("All")
+	_all_button = make_chip("All")
 	_all_button.tooltip_text = "Show every line"
 	_all_button.pressed.connect(func(): _set_hidden({}))
 	_lines_flow.add_child(_all_button)
@@ -322,7 +357,7 @@ func _build() -> void:
 	_add_field.tooltip_text = "Add a line: type its number (several: 24, 51) and press Enter"
 	_add_field.text_submitted.connect(_on_add_submitted)
 	_lines_flow.add_child(_add_field)
-	_lines_note = _make_label("", 12, INK_SECONDARY)
+	_lines_note = make_label("", 12, INK_SECONDARY)
 	_lines_note.mouse_filter = MOUSE_FILTER_PASS # Tooltip with the full text
 	_lines_note.clip_text = true # Width capped to the window in _relayout
 	_lines_note.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
@@ -330,7 +365,7 @@ func _build() -> void:
 	_lines_flow.add_child(_lines_note)
 
 	# Chart panel: clicks and scrolls on it must not reach the 3D view (a click there deselects the bus)
-	_chart = _make_panel(PANEL_COLOR)
+	_chart = make_panel(PANEL_COLOR)
 	_chart.name = "Chart"
 	_chart.mouse_filter = MOUSE_FILTER_STOP
 	_chart.mouse_force_pass_scroll_events = false
@@ -343,7 +378,7 @@ func _build() -> void:
 
 	var header := HBoxContainer.new()
 	rows.add_child(header)
-	_title = _make_label("", 15, INK_PRIMARY)
+	_title = make_label("", 15, INK_PRIMARY)
 	_title.size_flags_horizontal = SIZE_EXPAND_FILL
 	_title.clip_text = true
 	_title.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
@@ -365,7 +400,7 @@ func _build() -> void:
 	rows.add_child(status)
 	_status_swatch = _make_swatch(Occupancy.color(Occupancy.NO_DATA))
 	status.add_child(_status_swatch)
-	_status_label = _make_label("", 13, INK_PRIMARY)
+	_status_label = make_label("", 13, INK_PRIMARY)
 	_status_label.size_flags_horizontal = SIZE_EXPAND_FILL
 	_status_label.clip_text = true
 	_status_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
@@ -414,6 +449,7 @@ func _build() -> void:
 	_actual_check.focus_mode = FOCUS_NONE
 	_actual_check.tooltip_text = "Also draw what really happened after now (dotted), to compare with the forecast"
 	_actual_check.add_theme_font_size_override("font_size", 12)
+	_set_box_icons(_actual_check)
 	for color_name in ["font_color", "font_pressed_color", "font_focus_color"]:
 		_actual_check.add_theme_color_override(color_name, INK_SECONDARY)
 	for color_name in ["font_hover_color", "font_hover_pressed_color"]:
@@ -421,7 +457,7 @@ func _build() -> void:
 	_actual_check.toggled.connect(func(_on: bool): refresh())
 	actual.add_child(_actual_check)
 
-	_footer = _make_label("", 12, INK_SECONDARY)
+	_footer = make_label("", 12, INK_SECONDARY)
 	_footer.clip_text = true
 	_footer.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	_footer.mouse_filter = MOUSE_FILTER_PASS # Tooltip with the full text
@@ -444,13 +480,13 @@ func _build() -> void:
 	var tip_rows := VBoxContainer.new()
 	tip_rows.add_theme_constant_override("separation", 0)
 	_tooltip.add_child(tip_rows)
-	_tip_first = _make_label("", 12, INK_PRIMARY)
-	_tip_second = _make_label("", 12, INK_SECONDARY)
+	_tip_first = make_label("", 12, INK_PRIMARY)
+	_tip_second = make_label("", 12, INK_SECONDARY)
 	tip_rows.add_child(_tip_first)
 	tip_rows.add_child(_tip_second)
 	_ignore_mouse(_tooltip)
 
-func _make_panel(color: Color) -> PanelContainer:
+static func make_panel(color: Color) -> PanelContainer:
 	var panel := PanelContainer.new()
 	var style := StyleBoxFlat.new()
 	style.bg_color = color
@@ -459,7 +495,7 @@ func _make_panel(color: Color) -> PanelContainer:
 	panel.add_theme_stylebox_override("panel", style)
 	return panel
 
-func _make_label(text: String, font_size: int, color: Color) -> Label:
+static func make_label(text: String, font_size: int, color: Color) -> Label:
 	var label := Label.new()
 	label.text = text
 	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
@@ -467,15 +503,12 @@ func _make_label(text: String, font_size: int, color: Color) -> Label:
 	label.add_theme_color_override("font_color", color)
 	return label
 
-## Legend entry: swatch and label (a taller swatch for the highlighted stops: their poles are thicker)
-func _make_legend_item(color: Color, text: String, wide := false) -> HBoxContainer:
+## Legend entry: swatch and label
+func _make_legend_item(color: Color, text: String) -> HBoxContainer:
 	var item := HBoxContainer.new()
 	item.add_theme_constant_override("separation", 5)
-	var swatch := _make_swatch(color)
-	if wide:
-		swatch.custom_minimum_size = Vector2(12, 16)
-	item.add_child(swatch)
-	item.add_child(_make_label(text, 13, INK_PRIMARY))
+	item.add_child(_make_swatch(color))
+	item.add_child(make_label(text, 12, INK_PRIMARY))
 	return item
 
 ## 12x12 color square with a 1 px ring (the dark statuses are low-contrast on the panel)
@@ -492,29 +525,48 @@ func _draw_swatch(swatch: Control) -> void:
 	swatch.draw_rect(Rect2(Vector2.ZERO, swatch.size), swatch.get_meta("color"))
 	swatch.draw_rect(Rect2(Vector2(0.5, 0.5), swatch.size - Vector2.ONE), INK_SECONDARY, false, 1.0)
 
-## The same 12x12 swatch as a texture, for a checkbox icon
-static func _swatch_texture(color: Color) -> ImageTexture:
-	var image := Image.create(12, 12, false, Image.FORMAT_RGBA8)
+## The same 12x12 swatch as a texture, for a checkbox icon (tall: 12x16, the highlighted stops' thicker poles)
+static func _swatch_texture(color: Color, tall := false) -> ImageTexture:
+	var image := Image.create(12, 16 if tall else 12, false, Image.FORMAT_RGBA8)
 	image.fill(INK_SECONDARY)
-	image.fill_rect(Rect2i(1, 1, 10, 10), color)
+	image.fill_rect(Rect2i(1, 1, 10, image.get_height() - 2), color)
 	return ImageTexture.create_from_image(image)
 
-## Legend checkbox of a layer of poles: box, color swatch and name
-func _make_layer_check(text: String, color: Color, tooltip: String) -> CheckBox:
+## Legend checkbox of a layer of poles: box, color swatch and name, as compact as the legend's other rows
+static func make_check(text: String, icon: Texture2D, tooltip: String) -> CheckBox:
 	var check := CheckBox.new()
 	check.text = text
-	check.icon = _swatch_texture(color)
+	check.icon = icon
 	check.button_pressed = true
 	check.focus_mode = FOCUS_NONE
 	check.tooltip_text = tooltip
-	check.add_theme_font_size_override("font_size", 13)
+	check.add_theme_font_size_override("font_size", 12)
 	check.add_theme_constant_override("h_separation", 5)
+	var style := StyleBoxEmpty.new()
+	style.content_margin_top = 1
+	style.content_margin_bottom = 1
+	for state: String in ["normal", "pressed", "hover", "hover_pressed", "disabled", "focus"]:
+		check.add_theme_stylebox_override(state, style)
 	for color_name in ["font_color", "font_pressed_color", "font_hover_color", "font_hover_pressed_color", "font_focus_color"]:
 		check.add_theme_color_override(color_name, INK_PRIMARY)
+	check.add_theme_color_override("font_disabled_color", INK_MUTED)
+	_set_box_icons(check)
 	return check
 
+## The default empty box is dark gray: nearly invisible on these panels
+static func _set_box_icons(check: CheckBox) -> void:
+	check.add_theme_icon_override("unchecked", _box_texture(INK_SECONDARY))
+	check.add_theme_icon_override("unchecked_disabled", _box_texture(INK_MUTED))
+
+## An empty checkbox: a 1 px square ring, the size of the default theme's checkbox icons
+static func _box_texture(color: Color) -> ImageTexture:
+	var image := Image.create(16, 16, false, Image.FORMAT_RGBA8)
+	image.fill(color)
+	image.fill_rect(Rect2i(1, 1, 14, 14), Color(0, 0, 0, 0))
+	return ImageTexture.create_from_image(image)
+
 ## Line button: filled while the line is shown, outlined while it is hidden
-func _make_chip(text: String) -> Button:
+static func make_chip(text: String) -> Button:
 	var button := Button.new()
 	button.text = text
 	button.toggle_mode = true
@@ -583,7 +635,7 @@ func _make_key(style: String, text: String) -> HBoxContainer:
 	var key := HBoxContainer.new()
 	key.add_theme_constant_override("separation", 4)
 	key.add_child(_make_glyph(style))
-	key.add_child(_make_label(text, 12, INK_SECONDARY))
+	key.add_child(make_label(text, 12, INK_SECONDARY))
 	return key
 
 ## Drawn sample of a series style (the line glyphs are not in every font)
@@ -619,20 +671,17 @@ func _sync_statuses() -> void:
 		return
 	_statuses_version = data.statuses_version
 	for item in _status_items:
-		_legend_flow.remove_child(item)
+		_status_rows.remove_child(item)
 		item.queue_free()
 	_status_items = []
 	var statuses: Array = data.statuses_seen.keys()
 	statuses.sort()
 	statuses.append(Occupancy.NO_DATA) # Always listed: a bus can lose its data
-	var index := 1 # After the "Bus occupancy" title
 	for status in statuses:
 		var item := _make_legend_item(Occupancy.color(status), Occupancy.label(status))
 		_ignore_mouse(item)
-		_legend_flow.add_child(item)
-		_legend_flow.move_child(item, index)
+		_status_rows.add_child(item)
 		_status_items.append(item)
-		index += 1
 	_rows = data.chart_levels()
 	_row_of = {}
 	for i in _rows.size():
@@ -642,15 +691,16 @@ func _sync_statuses() -> void:
 		_layout_plot()
 	_relayout()
 
-## Legend, Lines panel (each wrapped when it does not fit on one line) and chart, in a column at the top left
+## The legend at the top right under the toolbar; the Lines panel (wrapped when it does not fit on one line) and the
+## chart in a column at the top left, clear of the right column
 func _relayout() -> void:
 	if not is_inside_tree():
 		return
-	var room := size.x - 2.0 * MARGIN
-	_legend.custom_minimum_size.x = maxf(minf(_line_width(_legend_flow, LEGEND_SEPARATION), room), 0.0)
 	_legend.reset_size()
-	_legend.position = Vector2(MARGIN, MARGIN)
-	var y := MARGIN + _legend.size.y + PADDING
+	_legend.position = Vector2(size.x - MARGIN - _legend.size.x, _right_top)
+	var right_width := maxf(_legend.size.x if _legend.visible else 0.0, _right_reserved)
+	var room := size.x - 2.0 * MARGIN - (right_width + MARGIN if right_width > 0.0 else 0.0)
+	var y := float(MARGIN)
 	# The note shows in full when it fits, else it ends with "…" (its tooltip has the full text)
 	var note_font := _lines_note.get_theme_font("font")
 	var note_width := note_font.get_string_size(_lines_note.text, HORIZONTAL_ALIGNMENT_LEFT, -1, 12).x
@@ -662,6 +712,9 @@ func _relayout() -> void:
 	_chart.custom_minimum_size.x = clampf(room, 0.0, CHART_SIZE.x) # The key row keeps it readable (~470 px)
 	_chart.reset_size()
 	_chart.position = Vector2(MARGIN, y)
+	_chart.visible = vehicle_id != "" and not (_settings_open and _chart.size.x > room)
+	if not _chart.visible:
+		_tooltip.visible = false
 
 ## Width of a panel's flow container on a single line (a flow container's minimum is its widest item)
 func _line_width(flow: HFlowContainer, separation: int) -> float:

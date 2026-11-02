@@ -6,6 +6,7 @@
     Exports the Godot project with the "STM Demo" preset (replay mode only: no RabbitMQ,
     MongoDB, Docker or network needed) and zips the result:
       visualization\Build\Demo\STM DT Demo.exe   + data_* folder (.NET runtime) + replays\ folder
+                                                + "Start in safe mode.bat" (OpenGL, Minimum quality)
       visualization\Build\STM-DT-Demo.zip       share this: unzip, double-click "STM DT Demo.exe"
     Every *.json replay in visualization\replays is bundled inside the exe.
     More replays can be dropped later into the replays\ folder next to the exe (no rebuild).
@@ -63,6 +64,15 @@ Copy more replay files (`*.json`, format `stm-dt-replay`) into this folder, then
   and add forecasts to it with the Python of the forecast environment (.venv-forecast, with Timestral):
   `.venv-forecast\Scripts\python software\recording forecast <replay>.json`
   See "Record & replay demo" in the project README.
+'@
+
+# For a computer where the demo does not start (no working Vulkan / Direct3D 12 driver) or is too slow even at a low
+# quality: the OpenGL renderer and the Minimum preset, for this run only (nothing is saved)
+$SafeModeBat = @'
+@echo off
+rem Safe mode: the OpenGL renderer and the Minimum display quality, for this run only.
+rem Use it when "STM DT Demo.exe" does not start or is too slow. Nothing is saved.
+start "" "%~dp0STM DT Demo.exe" --rendering-driver opengl3 --rendering-method gl_compatibility -- --quality=minimum
 '@
 
 function Write-Step([string]$Text) {
@@ -333,11 +343,14 @@ try {
         throw "The export did not pack any res://replays/*.json (check include_filter of the `"$Preset`" preset in visualization\export_presets.cfg)."
     }
 
-    Write-Step "4/5 Adding the replays folder (drop-in replays, no rebuild)"
+    Write-Step "4/5 Adding the replays folder (drop-in replays, no rebuild) and the safe-mode launcher"
     $dropDir = Join-Path $DemoDir "replays"
     New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
     [IO.File]::WriteAllText((Join-Path $dropDir "README.md"), $ReplaysReadme.Replace("`r`n", "`n").Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
     Write-Host "   $dropDir"
+    $safeModePath = Join-Path $DemoDir "Start in safe mode.bat"
+    [IO.File]::WriteAllText($safeModePath, $SafeModeBat.Replace("`r`n", "`n").Replace("`n", "`r`n") + "`r`n", (New-Object Text.ASCIIEncoding))
+    Write-Host "   $safeModePath"
 
     Write-Step "5/5 Zipping"
     Add-Type -AssemblyName System.IO.Compression
@@ -367,6 +380,7 @@ try {
     $bundled = if ($stored.Count -gt 0) { $packed.Count } else { $replays.Count }
     Write-Host "   Bundled    : $bundled replay(s) from visualization\replays"
     Write-Host "   Unzip, double-click `"STM DT Demo.exe`". More replays: copy *.json files into its replays\ folder."
+    Write-Host "   On a computer where it does not start or is too slow: `"Start in safe mode.bat`"."
     Write-Log @("", "OK: $ZipPath")
 } catch {
     $exitCode = 1
