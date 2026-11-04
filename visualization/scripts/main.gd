@@ -7,6 +7,9 @@ const OccupancyDataScript = preload("res://scripts/occupancy_data.gd")
 const OccupancyPanelScript = preload("res://scripts/occupancy_panel.gd")
 const QualityScript = preload("res://scripts/quality.gd")
 const SettingsPanelScript = preload("res://scripts/settings_panel.gd")
+const MapHeightsScript = preload("res://scripts/map_heights.gd")
+## The city's ground: its height grid places the buses and tells what is over the map (tools/bake_map_heights.gd)
+const MAP_HEIGHTS_PATH := "res://assets/map_heights.res"
 const SELFTEST_SPEED := 60.0
 const SELFTEST_SECONDS := 5.0
 const SHOT_DELAY := 2.5 # Real seconds at the default speed before the self-test screenshot
@@ -52,6 +55,7 @@ var _stops: Array[Dictionary] = [] # Spawned stops: {"node", "pole", "routes": {
 var _stop_materials := {} # "normal" / "other" -> StandardMaterial3D
 var _other_stops_shown := true # "Other stops" in the legend: the other lines' stops while a line is highlighted
 var _map_chunks: Array = [] # The city's MeshInstance3D chunks
+var _ground: MapHeightsScript # The city's height grid
 var _hidden_routes := {} # route -> true: lines hidden in the Lines panel (their buses and stops)
 var _highlight_route := "" # Line of the selected bus whose stops are highlighted, "" when none
 var _highlight_direction := -1 # ... its direction, -1 = both
@@ -100,6 +104,16 @@ func _ready() -> void:
 		forced_quality = "high" if _selftest_path != "" else ""
 	quality.load_settings("" if _selftest_path != "" else QualityScript.SETTINGS_PATH, forced_quality, not OS.has_feature("editor"))
 	_map_chunks = $Map.find_children("*", "MeshInstance3D", true, false)
+	# The city's ground (instead of collision meshes): the buses stand on its height grid, and a coarse height-map shape
+	# under the map model stops the clicks at the buildings (camera_3d.gd)
+	var map_model: Node3D = $Map.get_child(0)
+	_ground = load(MAP_HEIGHTS_PATH)
+	_ground.set_map_transform(map_model.global_transform)
+	Bus3D.ground = _ground
+	var ground_body := StaticBody3D.new()
+	ground_body.name = "GroundCollision"
+	ground_body.add_child(_ground.make_collision())
+	map_model.add_child(ground_body)
 	for reference in $MapInterpolation/ReferencePoints.get_children():
 		reference.get_child(0).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF # A marker: no shadow
 	_apply_quality()
@@ -615,21 +629,9 @@ func clear_buses() -> void:
 	for vehicle_id in buses.keys():
 		remove_bus(vehicle_id)
 
-## True when the point is above the modeled city: a ray straight down hits the map (buses are skipped)
+## True when the point is above the modeled city (its height grid has ground there)
 func is_over_map(point: Vector3) -> bool:
-	var origin := Vector3(point.x, 1000.0, point.z)
-	var query := PhysicsRayQueryParameters3D.create(origin, origin + Vector3(0, -2000, 0))
-	var space_state := get_world_3d().direct_space_state
-	for attempt in 8:
-		var hit := space_state.intersect_ray(query)
-		if hit.is_empty():
-			return false
-		if $Map.is_ancestor_of(hit["collider"]):
-			return true
-		var excluded := query.exclude
-		excluded.append(hit["rid"])
-		query.exclude = excluded
-	return false
+	return not is_nan(_ground.height_at(point))
 
 func count_buses_on_map() -> int:
 	var count := 0
@@ -947,11 +949,44 @@ func _check_display() -> void:
 	_display_checks["overlaps"] = overlaps
 	_display_checks["window"] = "headless: layout not checked" if headless else str(get_viewport().get_visible_rect().size)
 
+	# Clicks (camera_3d.gd), through the city's ground collision (map_heights.gd), from straight above a bus on the map
+	# and every building: on the bus, it is selected; beside it, where the camera's ray meets the ground, released
+	var camera = $Camera3D
+	var clicks := {}
+	var target: Bus3D = bus if bus != null and is_over_map(bus.target_position) else null
+	for other: Bus3D in buses.values():
+		if target == null and is_over_map(other.target_position):
+			target = other
+	if target != null:
+		camera.reset_camera()
+		var above := _map_bounds().end.y + VIEW_CLEARANCE - target.global_position.y
+		camera.frame_target(target.global_position, above, 0.0, deg_to_rad(-89.0))
+		await get_tree().physics_frame
+		camera.handle_object_selection(camera.unproject_position(target.global_position + Vector3(0, 0.6, 0)))
+		clicks["bus_selected"] = camera.selected_object == target
+		var ground := Vector2.INF
+		for side in [Vector3.RIGHT, Vector3.LEFT, Vector3.FORWARD, Vector3.BACK]:
+			var spot: Vector2 = camera.unproject_position(target.global_position + side * 6.0)
+			var from: Vector3 = camera.project_ray_origin(spot)
+			var hit := get_world_3d().direct_space_state.intersect_ray(
+				PhysicsRayQueryParameters3D.create(from, from + camera.project_ray_normal(spot) * 10000.0))
+			if not hit.is_empty() and hit["collider"].name == "GroundCollision":
+				ground = spot
+				break
+		clicks["ground_hit"] = ground != Vector2.INF
+		if clicks["ground_hit"]:
+			camera.handle_object_selection(ground)
+			clicks["ground_releases"] = camera.selected_object == null
+		if bus != null:
+			camera.select_object(bus)
+	_display_checks["clicks"] = clicks
+
 	# Hide UI with the H key; the "Show UI" button goes once the mouse stays still and comes back when it moves; H again
 	var key := InputEventKey.new()
 	key.keycode = KEY_H
 	key.pressed = true
 	Input.parse_input_event(key)
+	Input.flush_buffered_events() # Handled now, not at the next frame
 	await get_tree().process_frame
 	var hidden: bool = settings_panel.ui_hidden and not occupancy_panel.visible and not replay_controls.visible \
 		and not settings_panel.rects().has("toolbar")
@@ -961,9 +996,11 @@ func _check_display() -> void:
 	motion.position = get_viewport().get_visible_rect().size * 0.5
 	motion.relative = Vector2(4, 0)
 	Input.parse_input_event(motion)
+	Input.flush_buffered_events()
 	await get_tree().process_frame
 	var button_back := settings_panel.show_button_visible()
 	Input.parse_input_event(key)
+	Input.flush_buffered_events() # Handled now, not at the next frame
 	await get_tree().process_frame
 	_display_checks["hide_ui"] = {"hidden": hidden, "show_button_faded": button_faded, "show_button_back": button_back,
 		"shown_again": not settings_panel.ui_hidden and occupancy_panel.visible and replay_controls.visible}
@@ -1113,14 +1150,28 @@ func _finish_selftest() -> void:
 			errors.append("The display settings were not saved or restored right: %s" % JSON.stringify(_display_checks))
 		if not _display_checks.get("overlaps", PackedStringArray(["not checked"])).is_empty():
 			errors.append("Panels overlap: %s" % ", ".join(_display_checks.get("overlaps", PackedStringArray(["not checked"]))))
+		var clicks: Dictionary = _display_checks.get("clicks", {})
+		if clicks.is_empty() or not clicks.values().all(func(passed): return passed):
+			errors.append("Clicks failed: %s" % JSON.stringify(clicks))
 		var hide_ui: Dictionary = _display_checks.get("hide_ui", {})
 		if hide_ui.is_empty() or not hide_ui.values().all(func(passed): return passed):
 			errors.append("Hide UI failed: %s" % JSON.stringify(hide_ui))
 	var display_ok := errors.size() == before_display
-	# The map's collision puts the buses on the ground (ground_y in bus_3d.gd): a ray down at its center must hit it
-	var map_collision := is_over_map(_map_bounds().get_center())
+	# The city's ground: its height grid puts the buses on it (ground_y in bus_3d.gd), and its collision stops the clicks.
+	# At the map's center, the grid has ground and a ray down hits the collision (past any bus there)
+	var center := _map_bounds().get_center()
+	var click := PhysicsRayQueryParameters3D.create(Vector3(center.x, 1000.0, center.z), Vector3(center.x, -1000.0, center.z))
+	var map_collision := false
+	for attempt in 8:
+		var hit := get_world_3d().direct_space_state.intersect_ray(click)
+		if hit.is_empty() or $Map.is_ancestor_of(hit["collider"]):
+			map_collision = is_over_map(center) and not hit.is_empty()
+			break
+		var excluded := click.exclude
+		excluded.append(hit["rid"])
+		click.exclude = excluded
 	if not map_collision:
-		errors.append("The map has no collision: the buses cannot be placed on the ground")
+		errors.append("The city's ground is missing: the buses cannot be placed on it, or clicks go through it")
 	var logged := _selftest_logger.take()
 	errors.append_array(logged["errors"])
 	var ok: bool = loaded and _frames_emitted >= 3 and not buses.is_empty() and occupancy_ok and lines_ok and display_ok \

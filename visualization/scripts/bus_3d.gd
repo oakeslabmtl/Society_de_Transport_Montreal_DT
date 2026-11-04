@@ -3,9 +3,10 @@ extends Node3D
 class_name  Bus3D
 
 const Occupancy = preload("res://scripts/occupancy.gd")
+const MapHeights = preload("res://scripts/map_heights.gd")
 const DEFAULT_OUTLINE := Color(0.97, 0.97, 0.97)
+const NO_GROUND_Y := 20.0 # Height of a bus where there is no city under it
 
-@export var ray_length : float = 20000.0  # Length of the ray
 @export var outline_color : Color
 
 @onready var ghost = $ghost
@@ -29,6 +30,7 @@ var _collision_layer := 1
 var t = 0.0
 # Replay speed multiplier (1.0 in live mode), scales the smoothing so buses keep up with fast playback
 static var playback_speed := 1.0
+static var ground: MapHeights = null # The city's height grid (main.gd): the buses stand on it
 
 func _ready() -> void:
 	var outline = bus_mesh.get_surface_override_material(0).next_pass.get_shader_parameter("outline_color")
@@ -54,8 +56,8 @@ func _physics_process(delta):
 func on_update(_target_pos: Vector3, _time: float, snap := false):
 	# If a new position was determined to move to
 	if _target_pos.x != target_position.x and _target_pos.z != target_position.z:
-		_target_pos.y = ground_y(_target_pos + Vector3(0, 100, 0))
-		# Glide from the previous target, at the new ground height (one raycast is enough)
+		_target_pos.y = ground_y(_target_pos)
+		# Glide from the previous target, at the new ground height (one lookup in the height grid is enough)
 		last_position = Vector3(target_position.x, _target_pos.y, target_position.z)
 		target_position = _target_pos
 		t = 0
@@ -99,19 +101,11 @@ func face_towards(point: Vector3):
 		look_at(point, Vector3.UP)
 		rotation.x = 0
 
-## Get the ground position downwards from the origin
-func ground_y(origin: Vector3):
-	var space_state = get_world_3d().direct_space_state
-	var end_point = origin - Vector3(0, ray_length, 0)  # Cast downwards
-	
-	var query = PhysicsRayQueryParameters3D.create(origin, end_point)
-	query.set_exclude([$bus/StaticBody3D])
-	var result = space_state.intersect_ray(query)
-	
-	if result:
-		return result.position.y
-	else:
-		return 20.0
+## The ground's height under a point: the city's height grid (map_heights.gd, baked with the ray this function cast on
+## the map's collision meshes); NO_GROUND_Y where there is no city
+func ground_y(point: Vector3) -> float:
+	var height := ground.height_at(point) if ground != null else NAN
+	return height if not is_nan(height) else NO_GROUND_Y
 
 func _on_selected():
 	selected = true
