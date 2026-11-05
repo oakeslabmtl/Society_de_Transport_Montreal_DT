@@ -170,6 +170,11 @@ func apply_render(viewport: Viewport, light: DirectionalLight3D, environment: En
 		RenderingServer.directional_shadow_atlas_set_size(shadows["atlas"], true)
 		RenderingServer.directional_soft_shadow_filter_set_quality(shadows["filter"])
 	var scale: float = values["render_scale"]
+	# On the web, the canvas has the screen's device pixels (two per CSS pixel on a Retina screen): the 3D view is drawn
+	# per CSS pixel, as on an ordinary screen (the browser's 3D is the slowest part). Never finer than the preset's own
+	# scale: a page zoomed out has less than one device pixel per CSS pixel
+	if OS.has_feature("web"):
+		scale = clampf(scale / DisplayServer.screen_get_scale(), 0.25, scale)
 	viewport.scaling_3d_mode = Viewport.SCALING_3D_MODE_FSR if scale < 1.0 and is_forward_plus() else Viewport.SCALING_3D_MODE_BILINEAR
 	viewport.scaling_3d_scale = scale
 	viewport.msaa_3d = {"msaa2": Viewport.MSAA_2X, "msaa4": Viewport.MSAA_4X}.get(values["antialiasing"], Viewport.MSAA_DISABLED)

@@ -1,7 +1,6 @@
-[gd_scene load_steps=10 format=3 uid="uid://c71j6ed8bjn6u"]
+[gd_scene load_steps=9 format=3 uid="uid://c71j6ed8bjn6u"]
 
 [ext_resource type="Script" uid="uid://6oogno61bml1" path="res://scripts/main.gd" id="1_sq1r5"]
-[ext_resource type="Script" uid="uid://dlikhv88p4p40" path="res://RabbitMQListener.cs" id="2_fk53w"]
 [ext_resource type="Script" uid="uid://cv3leabgippuq" path="res://scripts/camera_3d.gd" id="3_3dxm6"]
 [ext_resource type="PackedScene" uid="uid://x153n1ajrncp" path="res://assets/map not joined.glb" id="3_r0du0"]
 [ext_resource type="Script" uid="uid://pirbfucr43t7" path="res://scripts/map_interpolation.gd" id="4_cm0pq"]
@@ -35,9 +34,6 @@ directional_shadow_split_1 = 0.2
 directional_shadow_split_2 = 0.4
 directional_shadow_split_3 = 0.8
 directional_shadow_max_distance = 1000.0
-
-[node name="rmq_listener" type="Node" parent="."]
-script = ExtResource("2_fk53w")
 
 [node name="Camera3D" type="Camera3D" parent="."]
 transform = Transform3D(-0.583499, 0.489229, -0.648216, 1.58416e-08, 0.798184, 0.602414, 0.812114, 0.351508, -0.465739, 173.718, 79.7978, 43.4692)

@@ -105,6 +105,7 @@ The 3D model covers downtown Montréal only (roughly latitude 45.48 to 45.53, lo
   - Its export templates (in Godot: Editor > Manage Export Templates).
   - The .NET SDK 8 or newer. The .NET runtime alone is not enough.
 - Result: `visualization/Build/STM-DT-Demo.zip` (about 165 MB, 300 MB unzipped). The unzipped version is in `visualization/Build/Demo/`, so you can try it directly. Build output and its log (`visualization/Build/build_demo.log`) are not tracked by git.
+- Before zipping, the build is checked for the STM API key and anything that looks like a secret (see [Web version](#web-version-github-pages)). The check runs with the repository's `.venv` Python, else Python 3.10 or newer from the `PATH` (`py -3`, `python` or `python3`); without Python it is skipped with a warning, unless `STM_API_KEY` is set on the computer: then the build stops.
 - To use the zip:
   1. Unzip it (right-click > Extract All).
   2. Double-click `STM DT Demo.exe`. Keep `data_Below MTL_windows_x86_64` (the bundled .NET runtime) and `replays` next to it.
@@ -112,7 +113,30 @@ The 3D model covers downtown Montréal only (roughly latitude 45.48 to 45.53, lo
 - Top left: the **Lines** panel and, once you click a bus, its occupancy chart. Top right: the toolbar (**Legend**, **Settings**, **Hide UI**) and the legend, with checkboxes for the bus stops and the reference points. Bottom bar, one row: replay menu, Restart, Play/Pause, speed (1x to 60x), timeline, then the local time of the recording and the position in it (a second row shows only for a message, e.g. a replay that could not be read).
 - **Hide UI** (or the H key) hides every panel, for a clean view of the city. Move the mouse to see a **Show UI** button at the top right, or press H again.
 - On a computer where the demo does not start, or stays slow even at a low quality, double-click `Start in safe mode.bat` next to the exe. It uses the OpenGL renderer and the Minimum quality for that run (see [Display quality](#display-quality-and-slower-computers)).
-- Finding the buses: in replay mode the camera starts over the busiest group of buses on the map. In the bundled hour, about 55 of the roughly 95 buses in service at any moment are on the 3D map. The others are on parts of their routes outside the model (routes 55 and 80, for example, run far north of it). To reach them, right-click for free-fly and move with WASD (Space and Ctrl to go up and down); right-click again to get the cursor back.
+- Finding the buses: in replay mode the camera starts over the busiest group of buses on the map. In the bundled hour, about 55 of the roughly 95 buses in service at any moment are on the 3D map. The others are on parts of their routes outside the model (routes 55 and 80, for example, run far north of it). To reach them, right-click for free-fly and move with WASD (Space and Ctrl to go up and down, Space and Shift in the web version); right-click again to get the cursor back.
+
+### Web version (GitHub Pages)
+
+The replay demo also runs in a web browser, for a public link: https://oakeslabmtl.github.io/Society_de_Transport_Montreal_DT/ once published. It is the same viewer, built with the standard Godot because a web page runs no C#. So it plays the bundled replay only, with no live feed. Run from the Godot editor or as a Windows build, the viewer still connects to RabbitMQ: it creates the C# listener (`visualization/RabbitMQListener.cs`) itself, only where C# runs.
+
+- **Build it on your computer**: `.\build_demo.bat --web`, or `powershell -ExecutionPolicy Bypass -File build_demo.ps1 -Web`. It needs the standard Godot 4.7.1, not .NET: the script finds `Godot_v4.7.1-stable_win64_console.exe` the same way as the .NET one, or use `-Godot "<path>"` or `setx GODOT_WEB_BIN "<path>"`. It also needs that Godot's export templates (Editor > Manage Export Templates). Result: `visualization/Build/Web/`, about 160 MB, of which the pack (`index.pck`, with the city map and the replay) is 120 MB.
+- **Try it**: the page has to be served; opened from the disk, it does not start. Run `.venv\Scripts\python -m http.server 8060 --bind 127.0.0.1 --directory visualization\Build\Web`, then open http://127.0.0.1:8060.
+- **Publish it**: the GitHub Actions workflow `.github/workflows/web.yml` builds the same thing and publishes it. It runs only when started by hand.
+  1. Once, a repository admin sets Settings > Pages > Build and deployment > Source to **GitHub Actions**.
+  2. The workflow has to be on `master`: GitHub shows the "Run workflow" button only for workflows on the default branch, and the `github-pages` environment publishes from the default branch only.
+  3. Actions > **Web version** > Run workflow. The first run downloads Godot and its export templates (1.4 GB, of which it keeps the 20 MB of web templates). Later runs reuse them, and the map, from GitHub's cache, unless no run used it for 7 days: GitHub then deletes it.
+- **The STM API key is never in a build.** The viewer never reads it (only the Python recorder and the ingestion service do). Both builds, Windows and web, are checked before they are shared by `software/tools/check_export.py`. When `STM_API_KEY` is set on the computer, no file of the build, and no file of the project in `visualization/` (builds and the editor's `.godot` cache aside), may contain its value: as UTF-8 or UTF-16, zips included. The value is never printed. The pack and the project's files also may not hold a secret-like file (`.env`, `*.key`, `*.pem`, credentials...) or API-key wording (`apikey`, `api_key`, `api-key`). The project's files are checked because a pack holds the scripts compressed, where no search can see them. The export presets leave out `.env`-like files, the `Build/` folder and the editor tools. The GitHub workflow has no secret at all, so only the second part of the check runs there.
+- **Differences from the Windows demo**:
+  - In free-fly, Shift goes down, because Ctrl+W would close the tab. Esc ends free-fly.
+  - The panels keep their size on high-density screens (for example a Retina display).
+  - The quality starts at Low, the preset recommended for the WebGL 2 renderer (it has no ambient occlusion), and a first start that is not smooth lowers it, as on Windows.
+  - If the page is too slow, or the browser says it lost its WebGL context, add `?quality=minimum` to the address. It is the web's safe mode, for that visit only.
+- **Limits**:
+  - Each first visit downloads about 160 MB, and the page starts only once it has all of it. Chrome and Edge then keep it in their cache. Firefox does not cache a file as large as the 120 MB pack, so it downloads it again at each visit.
+  - GitHub Pages allows about 100 GB a month, so several hundred first visits.
+  - Use desktop Chrome, Edge or Firefox. Phones are not a target: the layout is the desktop one, and the memory is tight.
+  - Each run of the workflow fetches the 75 MB map from Git LFS, unless its cache already has it. The organization's free LFS bandwidth is 10 GB a month.
+- Tests of the check: `cd software` then `..\.venv\Scripts\python.exe -m unittest discover -s tests -p test_check_export.py -v`.
 
 ### Record a new hour
 

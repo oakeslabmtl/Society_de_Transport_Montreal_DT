@@ -15,6 +15,7 @@ const EXTERNAL_DIR_NAME := "replays"
 const HEADER_BYTES := 65536
 const MAX_STEP := 0.25 # Max real seconds advanced per frame (avoids jumps after a hitch)
 const WEEKDAYS := ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+const WEB_QUERY_ARGS := ["quality"] # The user arguments a web page's address may give (?quality=minimum)
 
 var current_time := 0.0
 var duration := 0.0
@@ -58,7 +59,14 @@ func _process(delta: float) -> void:
 ## Returns null when absent and "" for a bare "--name" flag.
 static func get_user_arg(arg_name: String) -> Variant:
 	var prefix := "--" + arg_name
-	for arg in OS.get_cmdline_user_args():
+	var args := OS.get_cmdline_user_args()
+	# A web page has no command line: its address's ?quality=<preset> is the safe mode (main.gd)
+	if OS.has_feature("web") and arg_name in WEB_QUERY_ARGS:
+		var query = JavaScriptBridge.eval("location.search", true)
+		if query is String:
+			for pair in query.trim_prefix("?").split("&", false):
+				args.append("--" + pair.uri_decode())
+	for arg in args:
 		if arg == prefix:
 			return ""
 		if arg.begins_with(prefix + "="):
@@ -79,8 +87,8 @@ static func get_cmdline_replay_path() -> String:
 ## Entries: {path, name, builtin, start_time (null when unknown)}
 func discover() -> Array:
 	external_dir = OS.get_executable_path().get_base_dir().path_join(EXTERNAL_DIR_NAME)
-	# Running from the editor binary, the executable folder is the Godot install, not a build
-	external_scanned = not OS.has_feature("editor")
+	# Running from the editor binary, the executable folder is the Godot install, not a build; a web page has no folder
+	external_scanned = not OS.has_feature("editor") and not OS.has_feature("web")
 	var entries: Array = []
 	if external_scanned:
 		entries.append_array(_scan_dir(external_dir, false))

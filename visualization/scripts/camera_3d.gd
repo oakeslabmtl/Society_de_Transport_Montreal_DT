@@ -1,5 +1,7 @@
 extends Camera3D
 
+const WEB_LOCK_GRACE_MS := 1000 # Web: the browser has this long to grant the mouse capture free-fly asked for
+
 @export var move_speed: float = 5.0
 @export var target_distance: float = 30.0
 @export var min_distance: float = 10.0
@@ -19,10 +21,17 @@ var yaw: float = 0.0
 var pitch: float = 0.0
 var rotating: bool = false
 var free_flying: bool = false  # Flag to toggle free-fly mode
+var _lock_requested_ms := 0 # When free-fly last captured the mouse (on the web, the browser grants it a moment later)
 
 func _ready():
 	original_position = global_transform.origin
 	original_rotation = global_transform.basis.get_rotation_quaternion()
+	# On the web, Ctrl+W (forward and down) would close the browser's tab: Shift goes down instead
+	if OS.has_feature("web"):
+		InputMap.action_erase_events("cam_move_down")
+		var shift := InputEventKey.new()
+		shift.physical_keycode = KEY_SHIFT
+		InputMap.action_add_event("cam_move_down", shift)
 
 ## Clicks and zoom are handled here rather than in _input, so the UI (replay bar, controls panel)
 ## consumes its own clicks and scrolls before they reach the camera
@@ -40,6 +49,7 @@ func _unhandled_input(event):
 			free_flying = !free_flying
 			if free_flying:
 				Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+				_lock_requested_ms = Time.get_ticks_msec()
 				# Cancel object selection when entering free-fly mode
 				if is_instance_valid(selected_object) and selected_object.has_method("_on_unselected"):
 					selected_object._on_unselected()
@@ -94,6 +104,12 @@ func _process(delta):
 	# The followed bus can be removed (replay seek / end of service)
 	if selected_object != null and not is_instance_valid(selected_object):
 		selected_object = null
+	# On the web, the browser releases the mouse by itself (Esc) or may refuse it: free-fly ends too, else every cursor
+	# move would turn the camera
+	if free_flying and OS.has_feature("web") and DisplayServer.mouse_get_mode() != DisplayServer.MOUSE_MODE_CAPTURED \
+			and Time.get_ticks_msec() - _lock_requested_ms > WEB_LOCK_GRACE_MS:
+		free_flying = false
+		Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	if selected_object:
 		var target_position = selected_object.global_transform.origin
 		
@@ -134,7 +150,7 @@ func handle_free_fly_movement(delta):
 		input_dir.x += 1
 	if Input.is_action_pressed("cam_move_up"):  # Space
 		input_dir.y += 1
-	if Input.is_action_pressed("cam_move_down"):  # Shift or Ctrl
+	if Input.is_action_pressed("cam_move_down"):  # Ctrl (Shift on the web)
 		input_dir.y -= 1
 	
 	# Normalize to prevent faster diagonal movement

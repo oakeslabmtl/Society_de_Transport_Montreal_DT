@@ -35,6 +35,7 @@ const TOOLTIPS := {
 	"show_fps": "Frames drawn per second, in this toolbar",
 }
 const NEEDS_FORWARD_PLUS := "Not available with the OpenGL renderer (safe mode, or no Vulkan / Direct3D 12)"
+const NOT_ON_WEB := "Not available in the web version (WebGL)"
 
 var quality = null # quality.gd
 var ui_hidden := false
@@ -74,10 +75,12 @@ func setup(quality_settings, bottom_limit: Callable) -> void:
 	quality = quality_settings
 	_bottom_limit = bottom_limit
 	_legend_button.set_pressed_no_signal(quality.values["legend"])
+	var web := OS.has_feature("web")
 	_info.text = "%s · %s. Recommended with this renderer: %s.%s" % [RenderingServer.get_video_adapter_name(),
-		"Vulkan / Direct3D 12" if Quality.is_forward_plus() else "OpenGL (Compatibility)",
+		"Vulkan / Direct3D 12" if Quality.is_forward_plus() else ("WebGL 2" if web else "OpenGL (Compatibility)"),
 		Quality.preset_label(Quality.recommended_preset()),
-		"" if quality.is_saved() else " Changes apply to this run only (safe mode or --quality): they are not saved."]
+		"" if quality.is_saved() else (" Changes apply to this visit only (?quality= in the address): they are not saved." \
+			if web else " Changes apply to this run only (safe mode or --quality): they are not saved.")]
 	refresh()
 	if quality.note != "":
 		show_note(quality.note)
@@ -283,7 +286,7 @@ func _build_panel() -> void:
 				list.add_item(choices[i][1])
 				if not Quality.is_available(key, choices[i][0]):
 					list.set_item_disabled(i, true)
-					list.set_item_tooltip(i, NEEDS_FORWARD_PLUS)
+					list.set_item_tooltip(i, NOT_ON_WEB if OS.has_feature("web") else NEEDS_FORWARD_PLUS)
 			list.item_selected.connect(func(index: int): _change(key, choices[index][0]))
 			_controls[key] = list
 		else:
@@ -294,7 +297,7 @@ func _build_panel() -> void:
 			var check := OccupancyPanelScript.make_check("", null, TOOLTIPS[key])
 			if not Quality.is_available(key, true):
 				check.disabled = true
-				check.tooltip_text = NEEDS_FORWARD_PLUS
+				check.tooltip_text = NOT_ON_WEB if OS.has_feature("web") else NEEDS_FORWARD_PLUS
 			check.toggled.connect(func(on: bool): _change(key, on))
 			grid.add_child(check)
 			_controls[key] = check

@@ -27,9 +27,12 @@ const HIDDEN_RELEASE_DELAY := 0.5 # Seconds before a selected bus whose line was
 const FRAME_CHECK_WARMUP := 3.0 # First start: seconds before measuring the frame rate (shaders compile meanwhile)
 const FRAME_CHECK_SECONDS := 5.0
 const MIN_SMOOTH_FPS := 24.0 # First start: below this, the GPU's preset is lowered (quality.gd)
+## The live feed's RabbitMQ listener. It is C#: only the .NET builds (the desktop viewer) have it; the web build, made
+## with the standard Godot, replays recordings
+const RABBITMQ_LISTENER_PATH := "res://RabbitMQListener.cs"
 
-@onready var rmq_connection = $rmq_listener
 @onready var map_interpolation = $MapInterpolation
+var rmq_connection: Node = null # The RabbitMQ listener (RabbitMQListener.cs) while the live feed is on
 
 var bus_3D_scene = preload("res://bus_3D.tscn")
 var bus_stop = preload("res://bus_stop.tscn")
@@ -79,6 +82,10 @@ var _selftest_checks := {} # Selection switch, stop highlight, Lines panel and l
 var _display_checks := {} # Display presets, saved settings, panel layout and Hide UI results
 
 func _ready() -> void:
+	# On the web, the page has the screen's device pixels (two per CSS pixel on a Retina screen): the panels are scaled to
+	# CSS pixels, as the rest of the browser is (quality.gd draws the 3D view at that resolution too)
+	if OS.has_feature("web"):
+		get_window().content_scale_factor = DisplayServer.screen_get_scale()
 	# Beacon colors compensate the scene's tonemapping (before any bus, i.e. any beacon material, exists)
 	Occupancy.set_environment($WorldEnvironment.environment)
 	var selftest_arg = ReplayPlayerScript.get_user_arg("selftest")
@@ -97,12 +104,14 @@ func _ready() -> void:
 			_shot_settings_path = shot_settings_arg
 
 	# Display quality: the saved settings (the self-test neither reads nor saves them: High, or --quality=<preset> for
-	# this run). An exported build starts lower after a run that did not end normally
+	# this run). An exported build starts lower after a run that did not end normally, except on the web: closing the tab
+	# never ends a run normally
 	quality = QualityScript.new()
 	var forced_quality = ReplayPlayerScript.get_user_arg("quality")
 	if not forced_quality is String:
 		forced_quality = "high" if _selftest_path != "" else ""
-	quality.load_settings("" if _selftest_path != "" else QualityScript.SETTINGS_PATH, forced_quality, not OS.has_feature("editor"))
+	quality.load_settings("" if _selftest_path != "" else QualityScript.SETTINGS_PATH, forced_quality,
+		not OS.has_feature("editor") and not OS.has_feature("web"))
 	_map_chunks = $Map.find_children("*", "MeshInstance3D", true, false)
 	# The city's ground (instead of collision meshes): the buses stand on its height grid, and a coarse height-map shape
 	# under the map model stops the clicks at the buildings (camera_3d.gd)
@@ -157,15 +166,20 @@ func _ready() -> void:
 	settings_panel.setup(quality, func(): return replay_controls.bar_rect().position.y if replay_controls.visible else get_viewport().get_visible_rect().size.y)
 	_sync_legend()
 
-	replay_mode = OS.has_feature("demo") or ReplayPlayerScript.get_user_arg("replay") != null or _selftest_path != ""
+	replay_mode = OS.has_feature("demo") or OS.has_feature("web") or ReplayPlayerScript.get_user_arg("replay") != null \
+		or _selftest_path != ""
 	var live_failed := false
 	if not replay_mode:
 		var listening := false
-		if rmq_connection.has_method("StartListening"):
+		rmq_connection = _make_rabbitmq_listener()
+		if rmq_connection != null:
+			rmq_connection.name = "rmq_listener"
+			add_child(rmq_connection)
 			rmq_connection.connect("OnMessage", _on_message)
 			listening = rmq_connection.StartListening()
 			if not listening:
-				rmq_connection.disconnect("OnMessage", _on_message)
+				rmq_connection.queue_free()
+				rmq_connection = null
 		if not listening:
 			push_warning("Live feed unavailable (RabbitMQ not reachable), falling back to replay mode")
 			replay_mode = true
@@ -182,11 +196,23 @@ func _ready() -> void:
 	elif quality.auto:
 		_check_frame_rate()
 
+## The live feed's RabbitMQ listener (RabbitMQListener.cs), not yet in the tree; null in a build without C# (the web
+## build)
+func _make_rabbitmq_listener() -> Node:
+	if not ClassDB.class_exists("CSharpScript"):
+		return null
+	var script: Script = load(RABBITMQ_LISTENER_PATH)
+	return script.new() if script != null and script.can_instantiate() else null
+
 ## A normal exit (window closed, end of the self-test): the next start keeps the settings (quality.gd)
 func _exit_tree() -> void:
 	quality.save(false)
 
 func _process(_delta: float) -> void:
+	# On the web, the pixel ratio changes when the page is zoomed or its window goes to another screen
+	if OS.has_feature("web") and not is_equal_approx(DisplayServer.screen_get_scale(), get_window().content_scale_factor):
+		get_window().content_scale_factor = DisplayServer.screen_get_scale()
+		_apply_quality()
 	_sync_occupancy_panel()
 	_sync_stop_highlight()
 
@@ -228,9 +254,12 @@ func _check_frame_rate() -> void:
 		await get_tree().create_timer(FRAME_CHECK_SECONDS).timeout
 		if not quality.auto: # The user chose settings meanwhile
 			return
-		if minimized or get_window().mode == Window.MODE_MINIMIZED or Engine.get_frames_drawn() == frames:
+		var elapsed := (Time.get_ticks_usec() - start) / 1e6
+		# Not measured: a minimized window, or a browser tab in the background (it draws nothing: the timer ends late)
+		if minimized or get_window().mode == Window.MODE_MINIMIZED or Engine.get_frames_drawn() == frames \
+				or elapsed > FRAME_CHECK_SECONDS * 1.5:
 			continue
-		var fps := (Engine.get_frames_drawn() - frames) / ((Time.get_ticks_usec() - start) / 1e6)
+		var fps := (Engine.get_frames_drawn() - frames) / elapsed
 		if fps >= MIN_SMOOTH_FPS or not quality.step_down():
 			quality.auto = false
 			quality.save()
@@ -1172,10 +1201,18 @@ func _finish_selftest() -> void:
 		click.exclude = excluded
 	if not map_collision:
 		errors.append("The city's ground is missing: the buses cannot be placed on it, or clicks go through it")
+	# The live feed: a .NET build (the desktop viewer) can make the RabbitMQ listener; a build without C# (the web) has none
+	var csharp := ClassDB.class_exists("CSharpScript")
+	var listener := _make_rabbitmq_listener()
+	var live_feed_listener := listener != null and listener.has_method("StartListening")
+	if listener != null:
+		listener.free()
+	if csharp and not live_feed_listener:
+		errors.append("The live feed's RabbitMQ listener (%s) cannot be made in this .NET build" % RABBITMQ_LISTENER_PATH)
 	var logged := _selftest_logger.take()
 	errors.append_array(logged["errors"])
 	var ok: bool = loaded and _frames_emitted >= 3 and not buses.is_empty() and occupancy_ok and lines_ok and display_ok \
-		and map_collision and logged["script_errors"] == 0
+		and map_collision and live_feed_listener == csharp and logged["script_errors"] == 0
 
 	var found: Array = []
 	for entry in replay_entries:
@@ -1228,6 +1265,9 @@ func _finish_selftest() -> void:
 		"godot_version": Engine.get_version_info()["string"],
 		"debug_build": OS.is_debug_build(),
 		"demo_feature": OS.has_feature("demo"),
+		"web": OS.has_feature("web"),
+		"csharp": csharp,
+		"live_feed_listener": live_feed_listener,
 	}
 	var exit_code := 0 if ok else 1
 	DirAccess.make_dir_recursive_absolute(_selftest_path.get_base_dir())

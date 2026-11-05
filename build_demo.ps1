@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the one-click replay demo of the STM bus digital twin.
+    Builds the one-click replay demo of the STM bus digital twin, for Windows or (-Web) for a web browser.
 
 .DESCRIPTION
     Exports the Godot project with the "STM Demo" preset (replay mode only: no RabbitMQ,
@@ -11,10 +11,24 @@
     Every *.json replay in visualization\replays is bundled inside the exe.
     More replays can be dropped later into the replays\ folder next to the exe (no rebuild).
 
+    With -Web: exports the "Web" preset with the standard Godot (a web page runs no C#: replays only):
+      visualization\Build\Web\index.html + index.pck, index.wasm...   a static site: GitHub Pages publishes it
+                                                                     (.github\workflows\web.yml builds it the same way)
+
+    Before it is shared, the build is checked (software\tools\check_export.py, with the repository's
+    .venv Python, else Python 3.10 or newer on the PATH): when STM_API_KEY is set on this computer, no
+    file of the build or of the project may contain its value, and neither the pack nor the project's
+    files may hold a secret-like file or API-key wording.
+
 .PARAMETER Godot
-    Path to the Godot 4.7 .NET (mono) editor, preferably the *_console.exe.
-    Default: $env:GODOT_BIN, else the newest matching Godot_v4.7*mono*console.exe found on the
+    Path to the Godot 4.7 .NET (mono) editor (with -Web: the standard Godot 4.7, not .NET), preferably
+    the *_console.exe.
+    Default: $env:GODOT_BIN (with -Web: $env:GODOT_WEB_BIN), else the newest matching
+    Godot_v4.7*mono*console.exe (with -Web: Godot_v4.7*console.exe without "mono") found on the
     Desktop, in Downloads, in Program Files or on the PATH.
+
+.PARAMETER Web
+    Builds the web version (visualization\Build\Web) instead of the Windows demo.
 
 .PARAMETER NoPause
     Never wait for a key press at the end (for scripts and automation).
@@ -23,9 +37,12 @@
     powershell -ExecutionPolicy Bypass -File build_demo.ps1
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File build_demo.ps1 -Godot "D:\Godot\Godot_v4.7.1-stable_mono_win64_console.exe" -NoPause
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File build_demo.ps1 -Web
 #>
 param(
     [string]$Godot = "",
+    [switch]$Web,
     [switch]$NoPause
 )
 
@@ -33,13 +50,23 @@ $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
 $Project = Join-Path $Root "visualization"
-$Preset = "STM Demo"
+$Preset = if ($Web) { "Web" } else { "STM Demo" }
 $BuildDir = Join-Path $Project "Build"
 $DemoDir = Join-Path $BuildDir "Demo"
 $ExePath = Join-Path $DemoDir "STM DT Demo.exe"
 $ZipPath = Join-Path $BuildDir "STM-DT-Demo.zip"
-$LogPath = Join-Path $BuildDir "build_demo.log"
+$WebDir = Join-Path $BuildDir "Web"
+$OutDir = if ($Web) { $WebDir } else { $DemoDir }
+$OutPath = if ($Web) { Join-Path $WebDir "index.html" } else { $ExePath }
+$LogPath = Join-Path $BuildDir $(if ($Web) { "build_web.log" } else { "build_demo.log" })
 $ReplaySource = Join-Path $Project "replays"
+$Checker = Join-Path $Root "software\tools\check_export.py"
+$MapPath = Join-Path $Project "assets\map not joined.glb"
+# The Godot edition: .NET for the Windows demo (the live feed's listener is C#), the standard one for the web (the
+# web export has no C#)
+$Edition = if ($Web) { "" } else { " .NET" }
+$ExeEnding = if ($Web) { "win64_console.exe" } else { "mono_win64_console.exe" }
+$GodotVariable = if ($Web) { "GODOT_WEB_BIN" } else { "GODOT_BIN" }
 
 $ReplaysReadme = @'
 # Extra replays
@@ -133,9 +160,10 @@ function Find-Godot([string]$Wanted) {
         if (-not (Test-Path -LiteralPath $Godot -PathType Leaf)) { throw "Godot not found at -Godot `"$Godot`"." }
         return Resolve-ConsoleExe $Godot
     }
-    if ($env:GODOT_BIN) {
-        if (-not (Test-Path -LiteralPath $env:GODOT_BIN -PathType Leaf)) { throw "GODOT_BIN points to a missing file: $($env:GODOT_BIN)" }
-        return Resolve-ConsoleExe $env:GODOT_BIN
+    $fromVariable = [Environment]::GetEnvironmentVariable($GodotVariable)
+    if ($fromVariable) {
+        if (-not (Test-Path -LiteralPath $fromVariable -PathType Leaf)) { throw "$GodotVariable points to a missing file: $fromVariable" }
+        return Resolve-ConsoleExe $fromVariable
     }
 
     $roots = @(
@@ -153,12 +181,12 @@ function Find-Godot([string]$Wanted) {
         if (-not $r.Path -or -not (Test-Path -LiteralPath $r.Path) -or $seen.ContainsKey($r.Path.ToLower())) { continue }
         $seen[$r.Path.ToLower()] = $true
         $found += @(Get-ChildItem -LiteralPath $r.Path -Recurse -Depth $r.Depth -File -Filter "Godot_v*_console.exe" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "*mono*" -and (Get-ExeVersion $_.Name) })
+            Where-Object { ($_.Name -like "*mono*") -ne [bool]$Web -and (Get-ExeVersion $_.Name) })
     }
     # A Godot folder added to the PATH
     $found += @(Get-Command -CommandType Application -Name "Godot_v*_console.exe" -ErrorAction SilentlyContinue |
         ForEach-Object { Get-Item -LiteralPath $_.Source } |
-        Where-Object { $_.Name -like "*mono*" -and (Get-ExeVersion $_.Name) })
+        Where-Object { ($_.Name -like "*mono*") -ne [bool]$Web -and (Get-ExeVersion $_.Name) })
     $found = @($found | Sort-Object FullName -Unique)
 
     # Same major.minor as the project only: another version would migrate project.godot and the .csproj
@@ -172,13 +200,15 @@ function Find-Godot([string]$Wanted) {
     if ($usable.Count -eq 0) {
         $others = ($found | ForEach-Object { "    " + $_.FullName }) -join "`n"
         if ($others) { $others = "`n  Found other versions:`n$others" }
-        $exe = "C:\path\to\Godot_v$Wanted-stable_mono_win64_console.exe"
-        throw ("Could not find the Godot $Wanted .NET editor (Godot_v$Wanted-stable_mono_win64_console.exe).$others`n" +
-            "  Download Godot $Wanted .NET from https://godotengine.org/download/archive/ , unzip it on the Desktop,`n" +
+        $exe = "C:\path\to\Godot_v$Wanted-stable_$ExeEnding"
+        $webArgument = if ($Web) { " -Web" } else { "" }
+        $webFlag = if ($Web) { " --web" } else { "" }
+        throw ("Could not find the Godot $Wanted$Edition editor (Godot_v$Wanted-stable_$ExeEnding).$others`n" +
+            "  Download Godot $Wanted$Edition from https://godotengine.org/download/archive/ , unzip it on the Desktop,`n" +
             "  or tell this script where it is, in one of these ways:`n" +
-            "    powershell -ExecutionPolicy Bypass -File build_demo.ps1 -Godot `"$exe`"`n" +
-            "    setx GODOT_BIN `"$exe`"   (then open a new window, or double-click build_demo.bat again)`n" +
-            "    `$env:GODOT_BIN = `"$exe`"; .\build_demo.bat --no-pause   (PowerShell, this window only)")
+            "    powershell -ExecutionPolicy Bypass -File build_demo.ps1$webArgument -Godot `"$exe`"`n" +
+            "    setx $GodotVariable `"$exe`"   (then open a new window, or double-click build_demo.bat again)`n" +
+            "    `$env:$GodotVariable = `"$exe`"; .\build_demo.bat$webFlag --no-pause   (PowerShell, this window only)")
     }
     # Exact version first (e.g. 4.7.1 for Godot.NET.Sdk/4.7.1), else the newest 4.7.x
     $exact = @($usable | Where-Object { (Get-ExeVersion $_.Name) -eq $wantedVersion })
@@ -188,14 +218,19 @@ function Find-Godot([string]$Wanted) {
 
 # Runs Godot, shows its output (without color codes), appends it to the log; returns the exit code
 function Invoke-Godot([string[]]$Arguments) {
-    Write-Log @("", "> `"$GodotExe`" " + (($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join " "))
+    return Invoke-Logged $GodotExe $Arguments
+}
+
+# Runs a program, shows its output (without color codes), appends it to the log; returns the exit code
+function Invoke-Logged([string]$Exe, [string[]]$Arguments) {
+    Write-Log @("", "> `"$Exe`" " + (($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join " "))
     $ansi = [regex]("$([char]27)" + '\[[0-9;]*[A-Za-z]')
     $lines = New-Object System.Collections.Generic.List[string]
     $previous = $ErrorActionPreference
     # Godot prints warnings on stderr; success is judged by the exit code and the files produced
     $ErrorActionPreference = "Continue"
     try {
-        & $GodotExe @Arguments 2>&1 | ForEach-Object {
+        & $Exe @Arguments 2>&1 | ForEach-Object {
             $line = $ansi.Replace([string]$_, "")
             $lines.Add($line)
             Write-Host "   $line"
@@ -207,6 +242,27 @@ function Invoke-Godot([string[]]$Arguments) {
     Write-Log $lines.ToArray()
     $script:GodotOutput = $lines
     return $code
+}
+
+# A Python 3.10+ to run software\tools\check_export.py: the repository's .venv, else py -3, python or python3 on the
+# PATH (the Microsoft Store's "python" placeholder fails the test). Returns @(exe, arguments...) or $null
+function Find-Python {
+    $candidates = @(@((Join-Path $Root ".venv\Scripts\python.exe")), @("py", "-3"), @("python"), @("python3"))
+    foreach ($candidate in $candidates) {
+        $exe = $candidate[0]
+        if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { continue }
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $rest = @($candidate | Select-Object -Skip 1)
+            & $exe @rest -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { return ,$candidate } # The comma keeps a one-item array an array
+        } catch {
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+    }
+    return $null
 }
 
 # Reads "name" from the start of a replay file; returns $null when it does not look like a replay
@@ -233,57 +289,80 @@ function Test-ReplayForecast([string]$Path) {
 $exitCode = 0
 $started = Get-Date
 try {
-    Write-Host "STM digital twin - one-click demo build" -ForegroundColor White
+    Write-Host $(if ($Web) { "STM digital twin - web version build" } else { "STM digital twin - one-click demo build" }) -ForegroundColor White
     New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-    Set-Content -LiteralPath $LogPath -Value "build_demo.ps1 started $($started.ToString('yyyy-MM-dd HH:mm:ss'))" -Encoding UTF8
+    # Godot must not import the builds: their images and .json files would end up in the next export
+    $gdIgnore = Join-Path $BuildDir ".gdignore"
+    if (-not (Test-Path -LiteralPath $gdIgnore)) { [IO.File]::WriteAllText($gdIgnore, "") }
+    Set-Content -LiteralPath $LogPath -Value "build_demo.ps1$(if ($Web) { ' -Web' }) started $($started.ToString('yyyy-MM-dd HH:mm:ss'))" -Encoding UTF8
+    $steps = if ($Web) { 4 } else { 6 }
 
-    Write-Step "1/5 Checking tools and replays"
+    Write-Step "1/$steps Checking tools and replays"
     if (-not (Test-Path -LiteralPath (Join-Path $Project "project.godot"))) { throw "No Godot project at $Project" }
+    # A clone without Git LFS has a small text pointer instead of the map: it would export an empty city
+    if (-not (Test-Path -LiteralPath $MapPath) -or (Get-Item -LiteralPath $MapPath).Length -lt 1MB) {
+        throw "$MapPath is missing or is a Git LFS pointer, not the map. Install Git LFS, then run: git lfs pull"
+    }
     $wanted = Get-ProjectGodotVersion
     $GodotExe = Find-Godot $wanted
     Write-Host "   Godot      : $GodotExe"
     $versionText = ((& $GodotExe --version) | Select-Object -Last 1)
     if ($versionText) { $versionText = $versionText.Trim() }
     Write-Host "   Version    : $versionText (project made for $wanted)"
-    if ($versionText -notmatch '\.mono') {
+    if ($Web -and $versionText -match '\.mono') {
+        throw "This Godot is the .NET (mono) edition, which cannot export to the web: get the standard Godot $wanted (not .NET)."
+    }
+    if (-not $Web -and $versionText -notmatch '\.mono') {
         throw "This Godot is not the .NET (mono) edition. The project uses C#: get Godot $wanted .NET."
     }
     $versionMatch = [regex]::Match($versionText, '^(\d+)\.(\d+)')
     $wantedVersion = ConvertTo-Version $wanted
     if (-not $versionMatch.Success -or [int]$versionMatch.Groups[1].Value -ne $wantedVersion.Major -or [int]$versionMatch.Groups[2].Value -ne $wantedVersion.Minor) {
-        throw "Godot $versionText cannot build this project (made for $wanted): it would migrate project.godot. Use Godot $wanted .NET."
+        throw "Godot $versionText cannot build this project (made for $wanted): it would migrate project.godot. Use Godot $wanted$Edition."
     }
-    $templateMatch = [regex]::Match($versionText, '^(\d+\.\d+(?:\.\d+)?\.[A-Za-z0-9]+\.mono)')
+    $templateMatch = [regex]::Match($versionText, '^(\d+\.\d+(?:\.\d+)?\.[A-Za-z0-9]+(?:\.mono)?)')
+    # Web: single-threaded (GitHub Pages cannot send the headers a multi-threaded page needs)
+    $templateFile = if ($Web) { "web_nothreads_release.zip" } else { "windows_release_x86_64.exe" }
     if ($templateMatch.Success) {
         $templateName = $templateMatch.Groups[1].Value
         $templateDirs = @(
             (Join-Path $env:APPDATA "Godot\export_templates\$templateName"),
             (Join-Path (Split-Path -Parent $GodotExe) "editor_data\export_templates\$templateName")
         )
-        $hasTemplates = @($templateDirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ "windows_release_x86_64.exe") }).Count -gt 0
+        $hasTemplates = @($templateDirs | Where-Object { Test-Path -LiteralPath (Join-Path $_ $templateFile) }).Count -gt 0
         if (-not $hasTemplates) {
             throw ("Export templates $templateName are not installed.`n" +
                 "  Open the project in Godot, then Editor > Manage Export Templates > Download and Install.")
         }
         Write-Host "   Templates  : $templateName"
     }
-    # The .NET runtime installs dotnet.exe too: only "dotnet --list-sdks" tells if an SDK is there
-    $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
-    $sdks = @()
-    if ($dotnet) {
-        $previous = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            $sdks = @(& $dotnet.Source --list-sdks 2>$null | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^(\d+)\.' -and [int]$Matches[1] -ge 8 })
-        } finally {
-            $ErrorActionPreference = $previous
+    # The .NET runtime installs dotnet.exe too: only "dotnet --list-sdks" tells if an SDK is there (the web needs none)
+    if (-not $Web) {
+        $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
+        $sdks = @()
+        if ($dotnet) {
+            $previous = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $sdks = @(& $dotnet.Source --list-sdks 2>$null | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^(\d+)\.' -and [int]$Matches[1] -ge 8 })
+            } finally {
+                $ErrorActionPreference = $previous
+            }
         }
+        if ($sdks.Count -eq 0) {
+            $what = if ($dotnet) { "No .NET SDK 8 or newer in $($dotnet.Source) (only the .NET runtime or an older SDK)" } else { "The .NET SDK is missing" }
+            throw "$what. It is needed to build the C# scripts: install .NET SDK 8 or newer from https://dotnet.microsoft.com/download"
+        }
+        Write-Host "   .NET SDK   : $(($sdks[-1] -split ' ')[0]) ($($dotnet.Source))"
     }
-    if ($sdks.Count -eq 0) {
-        $what = if ($dotnet) { "No .NET SDK 8 or newer in $($dotnet.Source) (only the .NET runtime or an older SDK)" } else { "The .NET SDK is missing" }
-        throw "$what. It is needed to build the C# scripts: install .NET SDK 8 or newer from https://dotnet.microsoft.com/download"
+    $python = Find-Python
+    if ($python) {
+        Write-Host "   Python     : $($python -join ' ') (checks the build)"
+    } elseif ($env:STM_API_KEY) {
+        throw "STM_API_KEY is set on this computer, but no Python 3.10 or newer was found to check that the build does not contain it. Install it, or the repository's .venv (see README)."
+    } else {
+        Write-Warning "No Python 3.10+ found: the build will not be checked for secrets (software\tools\check_export.py)."
     }
-    Write-Host "   .NET SDK   : $(($sdks[-1] -split ' ')[0]) ($($dotnet.Source))"
 
     $replays = @(Get-ChildItem -LiteralPath $ReplaySource -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -eq ".json" } | Sort-Object Name)
     if ($replays.Count -eq 0) {
@@ -311,77 +390,109 @@ try {
     $env:MSBUILDDISABLENODEREUSE = "1"
     $env:DOTNET_CLI_USE_MSBUILD_SERVER = "0"
 
-    Write-Step "2/5 Importing the project (assets, script caches)"
+    Write-Step "2/$steps Importing the project (assets, script caches)"
     $code = Invoke-Godot @("--headless", "--path", $Project, "--import")
     if ($code -ne 0) { throw "Godot --import failed with exit code $code (see $LogPath)." }
 
-    Write-Step "3/5 Exporting preset `"$Preset`" (C# build + pack, takes a minute or two)"
-    if (Test-Path -LiteralPath $DemoDir) {
+    Write-Step "3/$steps Exporting preset `"$Preset`" ($(if ($Web) { 'pack' } else { 'C# build + pack' }), takes a minute or two)"
+    if (Test-Path -LiteralPath $OutDir) {
         try {
-            Remove-Item -LiteralPath $DemoDir -Recurse -Force
+            Remove-Item -LiteralPath $OutDir -Recurse -Force
         } catch {
-            throw "Cannot delete the previous build in $DemoDir (is `"STM DT Demo.exe`" still running?): $($_.Exception.Message)"
+            $inUse = if ($Web) { "is a file of it open, or served?" } else { "is `"STM DT Demo.exe`" still running?" }
+            throw "Cannot delete the previous build in $OutDir ($inUse): $($_.Exception.Message)"
         }
     }
     # Also the previous zip: a failed build must not leave an outdated zip that looks shareable
-    if (Test-Path -LiteralPath $ZipPath) {
+    if (-not $Web -and (Test-Path -LiteralPath $ZipPath)) {
         try {
             Remove-Item -LiteralPath $ZipPath -Force
         } catch {
             throw "Cannot delete the previous $ZipPath (is it open in another program?): $($_.Exception.Message)"
         }
     }
-    New-Item -ItemType Directory -Force -Path $DemoDir | Out-Null
-    $code = Invoke-Godot @("--headless", "--path", $Project, "--export-release", $Preset, $ExePath)
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    $code = Invoke-Godot @("--headless", "--path", $Project, "--export-release", $Preset, $OutPath)
     if ($code -ne 0) { throw "Godot export failed with exit code $code (see $LogPath)." }
-    if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) { throw "Godot finished but $ExePath was not created (see $LogPath)." }
-    $dataDirs = @(Get-ChildItem -LiteralPath $DemoDir -Directory -Filter "data_*")
-    if ($dataDirs.Count -eq 0) { throw "Godot finished but the .NET data_* folder is missing in $DemoDir (see $LogPath)." }
+    if ($Web) {
+        foreach ($name in @("index.html", "index.js", "index.wasm", "index.pck")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $WebDir $name) -PathType Leaf)) { throw "Godot finished but $name was not created in $WebDir (see $LogPath)." }
+        }
+    } else {
+        if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) { throw "Godot finished but $ExePath was not created (see $LogPath)." }
+        $dataDirs = @(Get-ChildItem -LiteralPath $DemoDir -Directory -Filter "data_*")
+        if ($dataDirs.Count -eq 0) { throw "Godot finished but the .NET data_* folder is missing in $DemoDir (see $LogPath)." }
+    }
     $stored = @($script:GodotOutput | Where-Object { $_ -match 'Storing File: ' })
     $packed = @($stored | Where-Object { $_ -match 'Storing File: res://replays/.+\.json' })
     if ($replays.Count -gt 0 -and $stored.Count -gt 0 -and $packed.Count -eq 0) {
         throw "The export did not pack any res://replays/*.json (check include_filter of the `"$Preset`" preset in visualization\export_presets.cfg)."
     }
 
-    Write-Step "4/5 Adding the replays folder (drop-in replays, no rebuild) and the safe-mode launcher"
-    $dropDir = Join-Path $DemoDir "replays"
-    New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
-    [IO.File]::WriteAllText((Join-Path $dropDir "README.md"), $ReplaysReadme.Replace("`r`n", "`n").Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
-    Write-Host "   $dropDir"
-    $safeModePath = Join-Path $DemoDir "Start in safe mode.bat"
-    [IO.File]::WriteAllText($safeModePath, $SafeModeBat.Replace("`r`n", "`n").Replace("`n", "`r`n") + "`r`n", (New-Object Text.ASCIIEncoding))
-    Write-Host "   $safeModePath"
-
-    Write-Step "5/5 Zipping"
-    Add-Type -AssemblyName System.IO.Compression
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $archive = [IO.Compression.ZipFile]::Open($ZipPath, [IO.Compression.ZipArchiveMode]::Create)
-    $zipped = $false
-    try {
-        $prefixLength = $DemoDir.TrimEnd("\").Length + 1
-        foreach ($file in Get-ChildItem -LiteralPath $DemoDir -Recurse -File) {
-            # Entry names with "/" (CreateFromDirectory writes "\" on Windows PowerShell 5.1)
-            $entryName = $file.FullName.Substring($prefixLength).Replace("\", "/")
-            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
-        }
-        $zipped = $true
-    } finally {
-        $archive.Dispose()
-        # Never leave a truncated zip that looks shareable
-        if (-not $zipped) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
+    if (-not $Web) {
+        Write-Step "4/$steps Adding the replays folder (drop-in replays, no rebuild) and the safe-mode launcher"
+        $dropDir = Join-Path $DemoDir "replays"
+        New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dropDir "README.md"), $ReplaysReadme.Replace("`r`n", "`n").Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        Write-Host "   $dropDir"
+        $safeModePath = Join-Path $DemoDir "Start in safe mode.bat"
+        [IO.File]::WriteAllText($safeModePath, $SafeModeBat.Replace("`r`n", "`n").Replace("`n", "`r`n") + "`r`n", (New-Object Text.ASCIIEncoding))
+        Write-Host "   $safeModePath"
     }
 
-    $elapsed = (Get-Date) - $started
-    $zipSize = (Get-Item -LiteralPath $ZipPath).Length / 1MB
-    Write-Host ""
-    Write-Host ("Done in {0:N0} min {1:N0} s." -f [math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds) -ForegroundColor Green
-    Write-Host "   Try it     : $ExePath"
-    Write-Host ("   Share this : {0} ({1:N0} MB)" -f $ZipPath, $zipSize)
-    $bundled = if ($stored.Count -gt 0) { $packed.Count } else { $replays.Count }
-    Write-Host "   Bundled    : $bundled replay(s) from visualization\replays"
-    Write-Host "   Unzip, double-click `"STM DT Demo.exe`". More replays: copy *.json files into its replays\ folder."
-    Write-Host "   On a computer where it does not start or is too slow: `"Start in safe mode.bat`"."
-    Write-Log @("", "OK: $ZipPath")
+    # The key's value reaches the checker through the environment only (never on a command line)
+    Write-Step "$(if ($Web) { 4 } else { 5 })/$steps Checking the build: no STM API key, nothing that looks like a secret"
+    if ($python) {
+        $code = Invoke-Logged $python[0] (@($python | Select-Object -Skip 1) + @("-I", $Checker, $OutDir, "--project=$Project"))
+        if ($code -ne 0) { throw "The build has something that must not be shared (see above): $(if ($Web) { 'do not publish it' } else { 'it was not zipped' })." }
+    } else {
+        Write-Host "   Skipped: no Python." -ForegroundColor Yellow
+    }
+
+    if ($Web) {
+        $elapsed = (Get-Date) - $started
+        # A command to paste in cmd or PowerShell, from the repository root (the full .venv path has spaces)
+        $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
+        $serve = if (-not $python) { "python" } elseif ($python[0] -eq $venvPython) { ".venv\Scripts\python" } else { $python -join " " }
+        Write-Host ""
+        Write-Host ("Done in {0:N0} min {1:N0} s." -f [math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds) -ForegroundColor Green
+        Write-Host ("   Web build  : {0} ({1:N0} MB)" -f $WebDir, ((Get-ChildItem -LiteralPath $WebDir -File | Measure-Object Length -Sum).Sum / 1MB))
+        Write-Host "   Try it     : from the repository root, $serve -m http.server 8060 --bind 127.0.0.1 --directory visualization\Build\Web"
+        Write-Host "                then open http://127.0.0.1:8060 (the page does not start when opened from the disk)."
+        Write-Host "   Publish    : GitHub Pages, with the `"Web version`" workflow (see the README, `"Web version`")."
+        Write-Log @("", "OK: $WebDir")
+    } else {
+        Write-Step "6/$steps Zipping"
+        Add-Type -AssemblyName System.IO.Compression
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [IO.Compression.ZipFile]::Open($ZipPath, [IO.Compression.ZipArchiveMode]::Create)
+        $zipped = $false
+        try {
+            $prefixLength = $DemoDir.TrimEnd("\").Length + 1
+            foreach ($file in Get-ChildItem -LiteralPath $DemoDir -Recurse -File) {
+                # Entry names with "/" (CreateFromDirectory writes "\" on Windows PowerShell 5.1)
+                $entryName = $file.FullName.Substring($prefixLength).Replace("\", "/")
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            }
+            $zipped = $true
+        } finally {
+            $archive.Dispose()
+            # Never leave a truncated zip that looks shareable
+            if (-not $zipped) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
+        }
+
+        $elapsed = (Get-Date) - $started
+        $zipSize = (Get-Item -LiteralPath $ZipPath).Length / 1MB
+        Write-Host ""
+        Write-Host ("Done in {0:N0} min {1:N0} s." -f [math]::Floor($elapsed.TotalMinutes), $elapsed.Seconds) -ForegroundColor Green
+        Write-Host "   Try it     : $ExePath"
+        Write-Host ("   Share this : {0} ({1:N0} MB)" -f $ZipPath, $zipSize)
+        $bundled = if ($stored.Count -gt 0) { $packed.Count } else { $replays.Count }
+        Write-Host "   Bundled    : $bundled replay(s) from visualization\replays"
+        Write-Host "   Unzip, double-click `"STM DT Demo.exe`". More replays: copy *.json files into its replays\ folder."
+        Write-Host "   On a computer where it does not start or is too slow: `"Start in safe mode.bat`"."
+        Write-Log @("", "OK: $ZipPath")
+    }
 } catch {
     $exitCode = 1
     Write-Host ""
