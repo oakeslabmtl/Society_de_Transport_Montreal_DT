@@ -7,8 +7,8 @@ extends Control
 signal replay_selected(path: String)
 signal layout_changed() # The bar's size changed (the settings panel stays above it)
 
+const OccupancyPanelScript = preload("res://scripts/occupancy_panel.gd") # The panel surface the other panels share
 const SPEEDS := [1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-const PANEL_COLOR := Color(0.08, 0.08, 0.08, 0.66)
 const LIVE_COLOR := Color(0.1, 0.6, 0.25)
 const ERROR_COLOR := Color(1.0, 0.45, 0.4)
 const INFO_COLOR := Color(0.85, 0.85, 0.85)
@@ -17,7 +17,7 @@ const TIME_FONT_SIZE := 13
 const TIME_SAMPLE := "Wed 0000-00-00 00:00:00 · 00:00 / 00:00" # Widest clock text: the timeline does not jitter
 const SHORT_TIME_SAMPLE := "00:00:00 · 00:00 / 00:00" # Without the date, when the row would not fit the window
 
-var player: Node = null
+var player: ReplayPlayer = null
 var live := false
 
 var _bar: PanelContainer
@@ -49,7 +49,7 @@ func _ready() -> void:
 	resized.connect(_relayout)
 	_relayout()
 
-func setup(replay_player: Node) -> void:
+func setup(replay_player: ReplayPlayer) -> void:
 	player = replay_player
 	player.state_changed.connect(_on_state_changed)
 	player.replay_loaded.connect(_on_replay_loaded)
@@ -81,7 +81,8 @@ func set_replays(entries: Array, selected_path: String) -> void:
 		if not entry["builtin"]:
 			label += "  (file)"
 		_replay_list.add_item(label)
-		_replay_list.set_item_tooltip(_replay_list.item_count - 1, entry["path"])
+		# A bundled replay's res:// path means nothing to a visitor: its file name only
+		_replay_list.set_item_tooltip(_replay_list.item_count - 1, entry["path"] if not entry["builtin"] else entry["path"].get_file())
 		_paths.append(entry["path"])
 	if _paths.is_empty():
 		_replay_list.add_item("No replays found")
@@ -109,16 +110,11 @@ func show_message(text: String, is_error := false) -> void:
 	_relayout()
 
 func _build() -> void:
-	_bar = PanelContainer.new()
+	_bar = OccupancyPanelScript.make_panel(OccupancyPanelScript.LEGEND_COLOR)
 	_bar.name = "Bar"
 	# Clicks and scrolls on the bar (padding and labels included) must not reach the 3D view behind it
 	_bar.mouse_filter = Control.MOUSE_FILTER_STOP
 	_bar.mouse_force_pass_scroll_events = false
-	var panel_style := StyleBoxFlat.new()
-	panel_style.bg_color = PANEL_COLOR
-	panel_style.set_content_margin_all(8)
-	panel_style.set_corner_radius_all(4)
-	_bar.add_theme_stylebox_override("panel", panel_style)
 	add_child(_bar)
 
 	var rows := VBoxContainer.new()
@@ -235,7 +231,7 @@ func _update_time_label() -> void:
 	var clock: String = player.get_clock_text()
 	if _short_clock and clock.length() > 8:
 		clock = clock.right(8) # The time of day
-	_time_label.text = "%s · %s / %s" % [clock, player.format_mmss(player.get_display_time()), player.format_mmss(player.duration)]
+	_time_label.text = "%s · %s / %s" % [clock, ReplayPlayer.format_mmss(player.get_display_time()), ReplayPlayer.format_mmss(player.duration)]
 
 func _refresh_buttons() -> void:
 	var has_replay: bool = player != null and player.has_frames()

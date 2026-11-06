@@ -36,6 +36,11 @@ const TOOLTIPS := {
 }
 const NEEDS_FORWARD_PLUS := "Not available with the OpenGL renderer (safe mode, or no Vulkan / Direct3D 12)"
 const NOT_ON_WEB := "Not available in the web version (WebGL)"
+## The licences of the data and the bus model ask for these credits wherever the viewer is shared (also in
+## visualization/credits.txt and the README)
+const CREDITS := "Bus data: Société de transport de Montréal open data (CC BY 4.0). Bus model: \"bus\" by The_Ping Pro " \
+	+ "(CC BY 4.0). Made with Godot Engine (MIT). A student project (Polytechnique Montréal, LOG6953FE), not " \
+	+ "affiliated with the STM."
 
 var quality = null # quality.gd
 var ui_hidden := false
@@ -255,14 +260,7 @@ func _build_panel() -> void:
 	var title := OccupancyPanelScript.make_label("Display quality", 15, OccupancyPanelScript.INK_PRIMARY)
 	title.size_flags_horizontal = SIZE_EXPAND_FILL
 	header.add_child(title)
-	var close_button := Button.new()
-	close_button.text = "×"
-	close_button.flat = true
-	close_button.focus_mode = FOCUS_NONE
-	close_button.tooltip_text = "Close the settings"
-	close_button.add_theme_font_size_override("font_size", 16)
-	close_button.add_theme_color_override("font_color", OccupancyPanelScript.INK_SECONDARY)
-	close_button.add_theme_color_override("font_hover_color", OccupancyPanelScript.INK_PRIMARY)
+	var close_button := OccupancyPanelScript.make_close_button("Close the settings")
 	close_button.pressed.connect(set_panel_open.bind(false))
 	header.add_child(close_button)
 
@@ -311,6 +309,10 @@ func _build_panel() -> void:
 	recommended.size_flags_horizontal = SIZE_SHRINK_BEGIN
 	recommended.pressed.connect(func(): _on_preset_selected(Quality.PRESETS.find(Quality.recommended_preset())))
 	_rows.add_child(recommended)
+	var credits := OccupancyPanelScript.make_label(CREDITS, 11, OccupancyPanelScript.INK_SECONDARY)
+	credits.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	credits.custom_minimum_size.x = _info.custom_minimum_size.x
+	_rows.add_child(credits)
 
 func _add_option_row(grid: GridContainer, text: String, tooltip: String) -> OptionButton:
 	var label := OccupancyPanelScript.make_label(text, 12, OccupancyPanelScript.INK_PRIMARY)

@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from recording import RecordingError
 
 ROOT = Path(__file__).resolve().parents[2]
 RECORDINGS_DIR = ROOT / "recordings"
@@ -18,12 +19,20 @@ def repo_relative(path:Path) -> str:
 
 
 def write_text_atomic(text:str, path:Path) -> int:
-    """Writes UTF-8 text through a temporary file, so a reader never sees half a file. Returns the size in bytes."""
+    """Writes UTF-8 text through a temporary file, so a reader never sees half a file. Returns the size in bytes.
+    A failed write (read-only file, full disk...) is a RecordingError and leaves no temporary file behind."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_bytes(text.encode("utf-8"))
-    os.replace(temporary, path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(text.encode("utf-8"))
+        os.replace(temporary, path)
+    except OSError as error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RecordingError(f"Could not write {display_path(path)}: {error.strerror or error}") from error
     return path.stat().st_size
 
 

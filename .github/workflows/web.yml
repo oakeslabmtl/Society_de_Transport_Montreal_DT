@@ -89,10 +89,15 @@ jobs:
           ~/godot/godot --headless --path visualization --import
       - name: Export the web version
         run: |
-          ~/godot/godot --headless --path visualization --export-release "Web" Build/Web/index.html
+          set -o pipefail
+          ~/godot/godot --headless --path visualization --export-release "Web" Build/Web/index.html 2>&1 | tee "$RUNNER_TEMP/export.log"
           for file in index.html index.js index.wasm index.pck; do
             if [ ! -s "visualization/Build/Web/$file" ]; then echo "::error::The export made no $file"; exit 1; fi
           done
+          # The replay is the page's only data (build_demo.ps1 makes the same check)
+          if ! grep -q 'Storing File: res://replays/.*\.json' "$RUNNER_TEMP/export.log"; then
+            echo "::error::The export packed no replay (include_filter of the Web preset): the page would show no buses"; exit 1
+          fi
           # The map alone is about 75 MB of the pack
           size=$(stat -c%s visualization/Build/Web/index.pck)
           if [ "$size" -lt 80000000 ]; then echo "::error::index.pck is $size bytes: the map is missing"; exit 1; fi

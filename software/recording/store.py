@@ -95,10 +95,10 @@ def entity_to_row(entity:dict) -> dict:
             extra[key] = value
 
     if "vehicle_id" not in row:
-        vehicle_id = entity.get(VEHICLE_ID_KEY, entity.get("id"))
+        vehicle_id = vehicle_key(entity)
         if vehicle_id is None:
             raise RecordingError(f"Vehicle position without 'vehicle.vehicle.id' nor 'id': {entity}")
-        row["vehicle_id"] = str(vehicle_id)
+        row["vehicle_id"] = vehicle_id
         if VEHICLE_ID_KEY not in entity:
             extra[NO_VEHICLE_ID] = True
 
@@ -118,8 +118,10 @@ def row_to_entity(row:sqlite3.Row) -> dict:
     return entity
 
 
-def vehicle_key(entity:dict) -> str:
-    return str(entity.get(VEHICLE_ID_KEY, entity.get("id")))
+def vehicle_key(entity:dict) -> str | None:
+    """The id of the bus: vehicle.vehicle.id, else the entity id, as a string; None when it has neither."""
+    vehicle = entity.get(VEHICLE_ID_KEY, entity.get("id"))
+    return None if vehicle is None else str(vehicle)
 
 
 def dedupe_by_vehicle(entities:list[dict]) -> list[dict]:
@@ -155,15 +157,16 @@ class RecordingStore:
     @classmethod
     def create(cls, path:Path, meta:dict, overwrite:bool=False) -> "RecordingStore":
         path = Path(path)
-        if path.exists():
-            if not overwrite:
-                raise RecordingError(f"{path} already exists. Choose another --name/--out, or add --force to replace it.")
-            path.unlink()
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        # A commit waits (up to LOCK_TIMEOUT_S) for an `info`/`export` reading the file instead of failing
-        store = cls(path, sqlite3.connect(path, timeout=LOCK_TIMEOUT_S))
-        store.connection.executescript(SCHEMA)
+        if path.exists() and not overwrite:
+            raise RecordingError(f"{path} already exists. Choose another --name/--out, or add --force to replace it.")
+        try:
+            path.unlink(missing_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # A commit waits (up to LOCK_TIMEOUT_S) for an `info`/`export` reading the file instead of failing
+            store = cls(path, sqlite3.connect(path, timeout=LOCK_TIMEOUT_S))
+            store.connection.executescript(SCHEMA)
+        except (OSError, sqlite3.Error) as error:      # e.g. a folder in the way, no write access, a full disk
+            raise RecordingError(f"Could not create {path}: {getattr(error, 'strerror', None) or error}") from error
         values = {"schema_version": SCHEMA_VERSION, "created_at": utc_now_iso(), "timezone": TIMEZONE, **meta}
         values["route_ids"] = json.dumps([str(route) for route in values.get("route_ids", [])])
         store.connection.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
@@ -259,18 +262,24 @@ class RecordingStore:
         return [Poll(*row) for row in self.connection.execute(query + " ORDER BY poll_time, poll_id", args)]
 
 
-    def entities_by_poll(self, polls:list[Poll]) -> dict[int, list[dict]]:
-        """Entities of the given polls, newest vehicle.timestamp first (the order of the live messages)."""
+    def entities_by_poll(self, polls:list[Poll], routes:list[str]=None) -> dict[int, list[dict]]:
+        """Entities of the given polls, newest vehicle.timestamp first (the order of the live messages).
+
+        With `routes`, the rows of other routes are left out in SQL. Rows without a route_id column (no route, or one of
+        an unexpected type, kept in extra_json) are still returned: the caller filters them on the entity.
+        """
         if not polls:
             return {}
         wanted = sorted({poll.poll_id for poll in polls})
         result = {poll_id: [] for poll_id in wanted}
+        # IFNULL, not `OR route_id IS NULL`: with OR, SQLite reads every row of those routes through idx_vp_route_ts
+        route_sql = f" AND IFNULL(route_id IN ({', '.join('?' * len(routes))}), 1)" if routes else ""
         # Short queries, fully fetched before converting: a recording in progress can commit in between
         for first in range(0, len(wanted), POLLS_PER_QUERY):
             chunk = wanted[first:first + POLLS_PER_QUERY]
             rows = self.connection.execute(
-                f"SELECT * FROM vehicle_positions WHERE poll_id IN ({', '.join('?' * len(chunk))}) "
-                "ORDER BY poll_id, vehicle_timestamp DESC, rowid", chunk).fetchall()
+                f"SELECT * FROM vehicle_positions WHERE poll_id IN ({', '.join('?' * len(chunk))}){route_sql} "
+                "ORDER BY poll_id, vehicle_timestamp DESC, rowid", chunk + list(routes or [])).fetchall()
             for row in rows:
                 result[row["poll_id"]].append(row_to_entity(row))
         return result

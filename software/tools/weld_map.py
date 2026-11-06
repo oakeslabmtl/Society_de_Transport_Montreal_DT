@@ -7,8 +7,9 @@ are dropped: the map's shader computes flat normals itself, and there is no text
 "map" (mapped to the flat shader in the .import file).
 
 It made visualization/assets/map not joined.glb (74.6 MB) from the original (535 MB, in git history). Run it on that
-original only. From the repository root, the original into a separate file (the tracked map and the index stay as
-they are), then the welding (numpy: the project's .venv has it):
+original only. From the repository root, in Git Bash (in Windows PowerShell 5.1, `>` re-encodes the output as text
+and corrupts the GLB), the original into a separate file (the tracked map and the index stay as they are), then the
+welding (numpy: the project's .venv has it):
     git cat-file --filters c9ee58a:"visualization/assets/map not joined.glb" > original.glb
     .venv/Scripts/python software/tools/weld_map.py original.glb "visualization/assets/map not joined.glb"
 """

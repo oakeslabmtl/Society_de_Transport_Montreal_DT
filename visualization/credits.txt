@@ -1,3 +1,9 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:cf4cc8af902918ad1f6d31a4814960fbdb50b6f0b404e70d4a9978fd325ff506
-size 140
+Credits
+
+- Bus data: Societe de transport de Montreal (STM) open data, licensed under Creative Commons Attribution 4.0
+  (https://creativecommons.org/licenses/by/4.0/): GTFS schedules, and GTFS-realtime bus positions and occupancy.
+- "bus" (https://skfb.ly/6wprD) by The_Ping Pro is licensed under Creative Commons Attribution (http://creativecommons.org/licenses/by/4.0/).
+- Bus outline shader: derived from the Normal/Depth outline shader by William Li (LoudFlameLava), MIT License.
+- Made with Godot Engine (https://godotengine.org/license), MIT License.
+
+A student project (Polytechnique Montreal, LOG6953FE), not affiliated with or endorsed by the STM.

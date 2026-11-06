@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 from recording import RecordingError
 from recording.forecast import (HIGH, LOW, MEDIAN, QUANTILES, ForecastPlan, ForecastResult, OccupancyGrid, forecast_result,
-                                frame_slots, score, vehicle_id)     # first: explains how to install numpy when it is missing
+                                frame_slots, score)     # first: explains how to install numpy when it is missing
 from recording.paths import display_path
+from recording.store import vehicle_key
 import numpy as np
 
 MODEL = "recording/location-logit"
@@ -144,7 +145,7 @@ def build_trip_grid(replay:dict, grid:OccupancyGrid, route_stops:dict | None) ->
     stations: list[np.ndarray | None] = []
     for slot, frame in frame_slots(replay, grid.step):
         for entity in frame.get("data") or ():
-            vehicle = vehicle_id(entity)
+            vehicle = vehicle_key(entity)
             if vehicle is None:
                 continue
             row = row_of[vehicle]

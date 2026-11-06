@@ -67,7 +67,7 @@ func clear() -> void:
 	_reset_forecast()
 
 ## Rebuilds the store from the replay loaded in player (a ReplayPlayer)
-func load_replay(player: Node) -> void:
+func load_replay(player: ReplayPlayer) -> void:
 	clear()
 	# Plain arrays while collecting (appending to a packed array stored in a dictionary copies it)
 	var collected := {}
@@ -303,28 +303,34 @@ func _parse_forecast(raw, start_time: float) -> String:
 		if not entries is Array:
 			return "vehicle %s: expected a list of forecasts" % vehicle_id
 		var pairs: Array = []
+		var ascending := true # The format stores them sorted by t: sorted here only when they are not
 		for i in entries.size():
 			var entry = entries[i]
 			if not entry is Dictionary or not Occupancy.is_number(entry.get("t")):
 				return "vehicle %s, forecast %d: expected {\"t\": number, \"q\": [...]}" % [vehicle_id, i]
-			var where := "vehicle %s at t=%s" % [vehicle_id, Occupancy.int_text(entry["t"])]
 			var q = entry.get("q")
 			if not q is Array or q.size() != quantiles.size():
-				return "%s: \"q\" has %s rows, expected %d (one per quantile)" % [where, str(q.size()) if q is Array else "no", quantiles.size()]
+				return "%s: \"q\" has %s rows, expected %d (one per quantile)" % [_where(vehicle_id, entry), str(q.size()) if q is Array else "no", quantiles.size()]
 			var rows: Array = []
 			for j in q.size():
 				var row = q[j]
 				if not row is Array or row.size() != point_count:
-					return "%s: q[%d] has %s values, expected %d" % [where, j, str(row.size()) if row is Array else "no", point_count]
+					return "%s: q[%d] has %s values, expected %d" % [_where(vehicle_id, entry), j, str(row.size()) if row is Array else "no", point_count]
+				# Checked one by one: PackedFloat64Array(row) would turn anything else into 0 (Occupancy.is_number, inlined:
+				# the bundled hour has 335,640 values)
 				for value in row:
-					if not Occupancy.is_number(value):
-						return "%s: q[%d] contains %s (not a number)" % [where, j, str(value)]
+					if not (value is float or value is int):
+						return "%s: q[%d] contains %s (not a number)" % [_where(vehicle_id, entry), j, str(value)]
 				rows.append(PackedFloat64Array(row))
-			pairs.append([start_time + float(entry["t"]), rows])
+			var origin := start_time + float(entry["t"])
+			if not pairs.is_empty() and origin < pairs[pairs.size() - 1][0]:
+				ascending = false
+			pairs.append([origin, rows])
 			origins_seen[float(entry["t"])] = true
 		if pairs.is_empty():
 			continue
-		pairs.sort_custom(func(a, b): return a[0] < b[0])
+		if not ascending:
+			pairs.sort_custom(func(a, b): return a[0] < b[0])
 		var origins := PackedFloat64Array()
 		var all_rows: Array = []
 		for pair in pairs:
@@ -350,6 +356,10 @@ func _parse_forecast(raw, start_time: float) -> String:
 				_learned_from = PackedFloat64Array()
 				push_warning("Occupancy: forecast %s details ignored: %s" % [key, error])
 	return ""
+
+## Where a forecast entry is, for an error message
+static func _where(vehicle_id, entry: Dictionary) -> String:
+	return "vehicle %s at t=%s" % [vehicle_id, Occupancy.int_text(entry["t"])]
 
 ## Reads the forecast's optional "calibration" or "training" key (what a calibration or the location model learned)
 ## into calibration or training, and _learned_from; returns an error or ""

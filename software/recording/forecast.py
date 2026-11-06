@@ -1,6 +1,6 @@
 """Occupancy forecasts for replays: what the viewer's bus chart shows after the observed occupancy.
 
-The demo exe runs no model: forecasts are precomputed here with Timestral (a time-series model by Mistral AI) and
+The viewer runs no model: forecasts are precomputed here with Timestral (a time-series model by Mistral AI) and
 stored in the replay under the key "forecast" (format: visualization/replays/README.md). Every `origin_every`
 seconds of replay time, each bus with `min_history` seconds of occupancy history gets a forecast of the next
 `horizon` seconds, made only from what was observed until then.
@@ -22,7 +22,7 @@ from typing import Callable, Protocol
 from recording import NothingToForecast, RecordingError
 from recording.paths import display_path, repo_relative
 from recording.replay import FORMAT as REPLAY_FORMAT, VERSION as REPLAY_VERSION
-from recording.store import DEFAULT_POLL_INTERVAL, OCCUPANCY_LABELS, utc_now_iso
+from recording.store import DEFAULT_POLL_INTERVAL, OCCUPANCY_LABELS, utc_now_iso, vehicle_key
 
 FORMAT = "stm-dt-occupancy-forecast"
 VERSION = 2                         # 2: values are ranks of the statuses in "levels" (1 stored the status values)
@@ -267,11 +267,6 @@ def occupancy_level(value) -> float:
     return float(value) if value == int(value) and 0 <= value <= MAX_LEVEL else math.nan
 
 
-def vehicle_id(entity:dict) -> str | None:
-    vehicle = entity.get("vehicle.vehicle.id", entity.get("id"))
-    return None if vehicle is None else str(vehicle)
-
-
 def read_replay(path:Path) -> dict:
     path = Path(path)
     if not path.is_file():
@@ -317,7 +312,7 @@ def build_grid(replay:dict) -> OccupancyGrid:
     for slot, frame in slotted:
         times[slot] = float(frame["t"])
         for entity in frame.get("data") or ():
-            vehicle = vehicle_id(entity)
+            vehicle = vehicle_key(entity)
             if vehicle is None:
                 continue
             if vehicle not in levels:
@@ -457,8 +452,6 @@ def compute_forecast(plan:ForecastPlan, forecaster:Forecaster,
                     into["at_horizon"].append((np.arange(plan.points) == plan.points - 1)[known])
         if on_progress:
             on_progress(number, len(plan.origins), t, len(vehicles))
-    if skipped:
-        logger.warning(f"Dropped {skipped} forecast(s) with NaN or infinite values.")
 
     def scored(parts:dict) -> dict:
         return score(**{name: np.concatenate(values) if values else np.empty(0) for name, values in parts.items()})

@@ -12,6 +12,7 @@ signal lines_added(routes: PackedStringArray) # Route numbers typed in the Lines
 signal layer_toggled(layer: String, shown: bool) # "stops", "other_stops" (while a line is highlighted) or "references"
 
 const Occupancy = preload("res://scripts/occupancy.gd")
+const OccupancyDataScript = preload("res://scripts/occupancy_data.gd")
 const LEGEND_COLOR := Color(0.08, 0.08, 0.08, 0.66) # Same surface as the replay bar
 const PANEL_COLOR := Color(0.08, 0.08, 0.08, 1.0) # Opaque: beacons behind the chart would show through the plot as streaks
 const RING_COLOR := Color(0.08, 0.08, 0.08) # Ring around the hover dots
@@ -44,12 +45,17 @@ const PLOT_BOTTOM := 16.0 # Room below the plot for the time labels
 const LEVEL_PAD := 6.0 # Keeps the top and bottom rows (lines and hover dots) inside the clipped plot
 const SNAP_PIXELS := 12.0 # Hover snaps to the nearest observation or forecast point within this distance
 
-var data = null # OccupancyData (occupancy_data.gd)
+var data: OccupancyDataScript = null
 var vehicle_id := "" # Bus shown in the chart, "" when the chart is hidden
 
 var _now := 0.0
 var _utc_offset := 0
 var _is_replay := false
+# What the chart was last built for: set_time skips a rebuild that would draw the same (paused, holding the last
+# frame, panels hidden, or moved by less than half a pixel)
+var _built_now := NAN
+var _built_offset := 0
+var _built_replay := false
 var _x_start := 0.0
 var _x_end := 1.0
 var _hover_x := -1.0 # Mouse x in plot-area coordinates, < 0 when not hovering
@@ -123,7 +129,7 @@ func _ready() -> void:
 	_lines.minimum_size_changed.connect(_relayout)
 	_relayout()
 
-func setup(occupancy_data) -> void:
+func setup(occupancy_data: OccupancyDataScript) -> void:
 	data = occupancy_data
 	_sync_statuses()
 
@@ -260,8 +266,16 @@ func set_time(now_unix: float, utc_offset_seconds: int, is_replay: bool) -> void
 	_utc_offset = utc_offset_seconds
 	_is_replay = is_replay
 	_sync_statuses()
-	if _chart.visible:
+	# The axis spans 30 minutes on ~400 px: at 1x it moves 0.2 px a second. New data marks the chart (mark_data_changed);
+	# what depends on time alone, a forecast going stale or "No forecast yet" ending, shows up to half a pixel late
+	# (2.5 s of replay time at 1x)
+	if _chart.is_visible_in_tree() and (is_nan(_built_now) or _utc_offset != _built_offset or _is_replay != _built_replay \
+			or absf(_now - _built_now) * _area.size.x >= 0.5 * (_x_end - _x_start)):
 		_rebuild()
+
+## The data changed (a replay frame was applied, a live message came): the next set_time rebuilds the chart
+func mark_data_changed() -> void:
+	_built_now = NAN
 
 ## Redraws after the data store changed (e.g. a new replay was loaded)
 func refresh() -> void:
@@ -383,15 +397,7 @@ func _build() -> void:
 	_title.clip_text = true
 	_title.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	header.add_child(_title)
-	var close_button := Button.new()
-	close_button.text = "×"
-	close_button.flat = true
-	close_button.focus_mode = FOCUS_NONE
-	close_button.tooltip_text = "Close the chart (releases the bus)"
-	close_button.add_theme_font_size_override("font_size", 16)
-	close_button.add_theme_color_override("font_color", INK_SECONDARY)
-	close_button.add_theme_color_override("font_hover_color", INK_PRIMARY)
-	close_button.add_theme_color_override("font_pressed_color", INK_PRIMARY)
+	var close_button := make_close_button("Close the chart (releases the bus)")
 	close_button.pressed.connect(func(): close_requested.emit())
 	header.add_child(close_button)
 
@@ -494,6 +500,19 @@ static func make_panel(color: Color) -> PanelContainer:
 	style.set_corner_radius_all(4)
 	panel.add_theme_stylebox_override("panel", style)
 	return panel
+
+## The "×" button that closes a panel
+static func make_close_button(tooltip: String) -> Button:
+	var button := Button.new()
+	button.text = "×"
+	button.flat = true
+	button.focus_mode = FOCUS_NONE
+	button.tooltip_text = tooltip
+	button.add_theme_font_size_override("font_size", 16)
+	button.add_theme_color_override("font_color", INK_SECONDARY)
+	button.add_theme_color_override("font_hover_color", INK_PRIMARY)
+	button.add_theme_color_override("font_pressed_color", INK_PRIMARY)
+	return button
 
 static func make_label(text: String, font_size: int, color: Color) -> Label:
 	var label := Label.new()
@@ -682,6 +701,7 @@ func _sync_statuses() -> void:
 		_ignore_mouse(item)
 		_status_rows.add_child(item)
 		_status_items.append(item)
+	_built_now = NAN # New rows: the next set_time redraws
 	_rows = data.chart_levels()
 	_row_of = {}
 	for i in _rows.size():
@@ -715,6 +735,8 @@ func _relayout() -> void:
 	_chart.visible = vehicle_id != "" and not (_settings_open and _chart.size.x > room)
 	if not _chart.visible:
 		_tooltip.visible = false
+	else:
+		_update_hover() # The chart may have moved
 
 ## Width of a panel's flow container on a single line (a flow container's minimum is its widest item)
 func _line_width(flow: HFlowContainer, separation: int) -> float:
@@ -735,6 +757,7 @@ func _layout_plot() -> void:
 		_label_column = ceilf(_label_column) + 8.0
 	_area.position = Vector2(_label_column, PLOT_TOP)
 	_area.size = Vector2(maxf(_plot.size.x - _label_column - 4.0, 1.0), maxf(_plot.size.y - PLOT_TOP - PLOT_BOTTOM, 1.0))
+	_update_hover() # The tooltip follows the new size
 
 ## Plot-area x of a unix time (computed in 64-bit before it becomes a Vector2 coordinate)
 func _x_of(unix_time: float) -> float:
@@ -831,6 +854,9 @@ func _rebuild() -> void:
 	_update_hover()
 	_plot.queue_redraw()
 	_area.queue_redraw()
+	_built_now = _now
+	_built_offset = _utc_offset
+	_built_replay = _is_replay
 
 func _update_texts() -> void:
 	var route: String = data.route_at(vehicle_id, _now)

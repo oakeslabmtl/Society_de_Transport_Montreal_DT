@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime
 from unittest import mock
 from zoneinfo import ZoneInfo
-from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, make_recording, typed
+from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, make_recording, run_cli, typed
 from recording import RecordingError
 from recording.cli import main
 from recording.store import Poll
@@ -219,8 +219,18 @@ class ReplayExportTest(TempDirTestCase):
             self.assertEqual(main(["export", str(self.recording), "--routes", "999"]), 2)
             self.assertEqual(main(["export", str(self.recording), "--start", "08:00", "--minutes", "5"]), 2)
             self.assertEqual(main(["export", str(self.recording), "--out", str(self.tmp / "replay.txt")]), 2)
-        self.assertEqual(stderr.getvalue().count("error: "), 4)
+            self.assertEqual(main(["info", str(self.recording), "--minutes", "0"]), 2)
+        self.assertEqual(stderr.getvalue().count("error: "), 5)
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_a_failed_write_is_friendly_and_leaves_no_temporary_file(self):
+        out = self.tmp / "replay.json"
+        out.mkdir()         # cannot be replaced by a file: PermissionError on Windows, IsADirectoryError elsewhere
+        code, _, stderr = run_cli("export", str(self.recording), "--out", str(out), "--force")
+        self.assertEqual(code, 2)
+        self.assertIn("error: Could not write", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertFalse((self.tmp / "replay.json.tmp").exists())
 
 
 class CliOutputTest(TempDirTestCase):

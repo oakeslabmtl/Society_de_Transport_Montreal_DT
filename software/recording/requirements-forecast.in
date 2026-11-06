@@ -5,7 +5,6 @@
 #   uv pip install --python .venv-forecast -r software\recording\requirements-forecast.in
 # Without uv: python -m venv .venv-forecast, then .venv-forecast\Scripts\python -m pip install -r <this file>
 # The forecast command itself needs only the standard library, numpy, tzdata and Timestral (which brings PyTorch).
-# Named .in, not .txt: *.txt files are stored with Git LFS in this repository.
 
 # Timestral 1.0.0 (not on PyPI), pinned to a commit. Code: Apache-2.0; model weights: Modified MIT.
 timestral @ git+https://github.com/mistralai/timestral.git@a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff

@@ -121,6 +121,7 @@ func load_replay(path: String) -> bool:
 	var json := JSON.new()
 	if json.parse(text) != OK:
 		return _fail("Invalid JSON in %s (line %d: %s)" % [path.get_file(), json.get_error_line(), json.get_error_message()])
+	text = "" # 4 bytes per character (57 MB for the bundled hour): freed before the scene is rebuilt
 	var root = json.data
 	if not root is Dictionary:
 		return _fail("%s is not a replay file (expected a JSON object)" % path.get_file())

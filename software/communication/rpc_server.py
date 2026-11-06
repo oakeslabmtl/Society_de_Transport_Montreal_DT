@@ -10,7 +10,7 @@ ARGS_ATTRIBUTE = "args"
 class RPCServer(RabbitMQ):
 
     def __init__(self, ip, port, username, password, vhost, exchange_name, exchange_type, ssl = None):
-        super().__init__(ip, port, username, password, vhost, exchange_name, exchange_type)
+        super().__init__(ip, port, username, password, vhost, exchange_name, exchange_type, ssl)
         self._logger = logging.getLogger("RPCServer")
 
 
@@ -34,7 +34,7 @@ class RPCServer(RabbitMQ):
 
     def serve(self, ch, method, props, body):
         body_json = decode_json(body)
-        self._logger.debug(f"Message received: \nf{body_json}")
+        self._logger.debug(f"Message received: \n{body_json}")
 
         # Check if reply_to is given
         if props.reply_to is None:
@@ -43,10 +43,10 @@ class RPCServer(RabbitMQ):
             return
 
         routing_key_reply = props.reply_to
-        self._logger.debug(f"routing_key_reply = f{routing_key_reply}")
+        self._logger.debug(f"routing_key_reply = {routing_key_reply}")
 
         request_id = props.correlation_id
-        self._logger.debug(f"request_id = f{request_id}")
+        self._logger.debug(f"request_id = {request_id}")
 
         # Create short function to reply
         def reply(msg):

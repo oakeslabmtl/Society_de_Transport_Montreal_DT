@@ -15,10 +15,11 @@ const SELFTEST_SECONDS := 5.0
 const SHOT_DELAY := 2.5 # Real seconds at the default speed before the self-test screenshot
 const CHART_DELAY := 1.0 # Real seconds between selecting the self-test bus and reading its chart
 const HEADING_STEP_DEGREES := 0.0003 # ~30 m, used to turn a snapped bus along its bearing
-const VIEW_GROUP_RADIUS := 80.0 # Replay start view: buses closer than this (m) form one busy area
-const VIEW_DISTANCE := 60.0 # Replay start view: camera distance (m) to that area (close: buses are small)
+# Distances are in scene units, about 5.3 m each
+const VIEW_GROUP_RADIUS := 80.0 # Replay start view: buses closer than this (~425 m) form one busy area
+const VIEW_DISTANCE := 60.0 # Replay start view: camera distance (~320 m) to that area (close: buses are small)
 const VIEW_PITCH := -45.0 # Replay start view: degrees below the horizon (steep enough to see the streets)
-const VIEW_CLEARANCE := 10.0 # Replay start view: the camera stays this far (m) above the tallest building
+const VIEW_CLEARANCE := 10.0 # Replay start view: the camera stays this far (~53 m) above the tallest building
 ## Stops of every bus route per direction (software/recording route-stops, from the GTFS in datasets/)
 const ROUTE_STOPS_PATH := "res://assets/route_stops.json"
 const STOP_HIGHLIGHT_SCALE := Vector3(1.6, 1.0, 1.6) # Poles of the selected bus's line are thicker
@@ -110,6 +111,8 @@ func _ready() -> void:
 	var forced_quality = ReplayPlayerScript.get_user_arg("quality")
 	if not forced_quality is String:
 		forced_quality = "high" if _selftest_path != "" else ""
+	forced_quality = forced_quality.strip_edges().to_lower() # ?quality=Minimum works too
+	var unknown_quality: String = forced_quality if forced_quality != "" and not forced_quality in QualityScript.PRESETS else ""
 	quality.load_settings("" if _selftest_path != "" else QualityScript.SETTINGS_PATH, forced_quality,
 		not OS.has_feature("editor") and not OS.has_feature("web"))
 	_map_chunks = $Map.find_children("*", "MeshInstance3D", true, false)
@@ -164,6 +167,8 @@ func _ready() -> void:
 	replay_controls.layout_changed.connect(settings_panel.fit_above_bar)
 	add_child(settings_panel)
 	settings_panel.setup(quality, func(): return replay_controls.bar_rect().position.y if replay_controls.visible else get_viewport().get_visible_rect().size.y)
+	if unknown_quality != "": # Else the web's safe mode (?quality=minimum) would fail silently on a typo
+		settings_panel.show_note("Unknown quality \"%s\": use minimum, low, medium, high or ultra." % unknown_quality)
 	_sync_legend()
 
 	replay_mode = OS.has_feature("demo") or OS.has_feature("web") or ReplayPlayerScript.get_user_arg("replay") != null \
@@ -321,7 +326,7 @@ func spawn_bus_stops():
 						continue
 					var node: Node3D = bus_stop.instantiate()
 					node.name = "Stop %s" % stop_id
-					node.get_child(0).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF # A 200 m pole: no shadow
+					node.get_child(0).cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF # A 200-unit (~1 km) pole: no shadow
 					var real_stop_pos: Vector2 = map_interpolation.get_position_by_closest_triangulation(float(info["lat"]), float(info["lon"]))
 					node.position = Vector3(real_stop_pos[0], 0, real_stop_pos[1])
 					$BusStops.add_child(node)
@@ -335,7 +340,7 @@ func spawn_bus_stops():
 ## route_stops.json (an empty dictionary when it cannot be read: no stops then)
 func _load_route_stops() -> Dictionary:
 	if _route_stops == null:
-		_route_stops = load_json_file(ROUTE_STOPS_PATH)
+		_route_stops = _load_json_file(ROUTE_STOPS_PATH)
 		if not _route_stops is Dictionary or not _route_stops.get("routes") is Dictionary or not _route_stops.get("stops") is Dictionary:
 			push_warning("No bus stops: %s is not a route-stops file (make it with software/recording route-stops)" % ROUTE_STOPS_PATH)
 			_route_stops = {}
@@ -538,6 +543,7 @@ func _on_replay_loaded(_meta: Dictionary) -> void:
 func _on_replay_frame(data: Array, is_seek: bool) -> void:
 	_frames_emitted += 1
 	apply_bus_data(data, is_seek, true)
+	occupancy_panel.mark_data_changed()
 	_max_buses = maxi(_max_buses, buses.size())
 	if _selftest_path != "":
 		_max_buses_on_map = maxi(_max_buses_on_map, count_buses_on_map())
@@ -552,14 +558,12 @@ func _on_message(message):
 		return
 	occupancy_data.record_live(json.data['data'], Time.get_unix_time_from_system())
 	apply_bus_data(json.data['data'])
+	occupancy_panel.mark_data_changed()
 
 ## Moves (or creates) the bus of every entity on a subscribed route.
 ## snap: jump to the new positions (replay seek). prune: remove the buses absent from bus_data (at once on a seek,
 ## otherwise after MISSED_FRAMES_KEPT frames in a row).
 func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
-	var debug_prints := OS.is_debug_build() and not replay_mode
-	if debug_prints:
-		print(bus_data)
 	var updated := {}
 	for entity in bus_data:
 		if not entity is Dictionary:
@@ -591,13 +595,7 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 			continue
 		var is_new := bus_3d == null
 		var bearing := ReplayPlayerScript.to_float(entity.get('vehicle.position.bearing'), 0.0)
-		var speed := ReplayPlayerScript.to_float(entity.get('vehicle.position.speed'), 0.0)
 		var has_bearing: bool = entity.has('vehicle.position.bearing')
-		if debug_prints:
-			print("Latitude: " + str(latitude))
-			print("Longitude: " + str(longitude))
-			print("Bearing: " + str(bearing))
-			print("Speed: " + str(speed))
 		if is_new:
 			bus_3d = bus_3D_scene.instantiate()
 			bus_3d.name = entity_id
@@ -608,7 +606,7 @@ func apply_bus_data(bus_data: Array, snap := false, prune := false) -> void:
 		var real_pos: Vector2 = cached[2] if same_place else map_interpolation.get_position_by_closest_triangulation(latitude, longitude)
 		_geo_cache[entity_id] = [latitude, longitude, real_pos]
 		# New buses appear directly at their position instead of flying in from the origin
-		bus_3d.on_update(Vector3(real_pos[0], 15, real_pos[1]), Time.get_ticks_msec(), snap or is_new)
+		bus_3d.on_update(Vector3(real_pos[0], 15, real_pos[1]), snap or is_new)
 		if (snap or is_new) and has_bearing:
 			face_bearing(bus_3d, latitude, longitude, bearing)
 	if prune:
@@ -633,7 +631,7 @@ func _update_bus_state(bus_3d: Bus3D, entity: Dictionary) -> void:
 		bus_3d.route_id = route
 		_apply_route_filter(bus_3d)
 
-## Turns a bus along its GTFS bearing (degrees clockwise from north) using a point a few meters ahead
+## Turns a bus along its GTFS bearing (degrees clockwise from north) using a point ~30 m ahead (HEADING_STEP_DEGREES)
 func face_bearing(object: Bus3D, lat: float, long: float, bearing_degrees: float):
 	var heading := deg_to_rad(bearing_degrees)
 	var ahead_lat := lat + HEADING_STEP_DEGREES * cos(heading)
@@ -715,26 +713,17 @@ func _map_bounds() -> AABB:
 		first = false
 	return bounds
 
-func load_json_file(file_path: String):
-	var file := FileAccess.open(file_path, FileAccess.READ)
-	if file:
-		print("Found file")
-		var content := file.get_as_text()
-		file.close()
-		
-		var json := JSON.new()
-		var parse_result := json.parse(content)
-		
-		if parse_result == 0:
-			var data = json.get_data()
-			return data
-		else:
-			push_error("Failed to parse JSON file")
-	else:
-		push_error("Failed to open file: " + file_path)
-	
-	print("Found no data")
-	return {}
+## A JSON file's data, null when it cannot be read or parsed (the error says why)
+func _load_json_file(file_path: String) -> Variant:
+	var text := FileAccess.get_file_as_string(file_path)
+	if text == "":
+		push_error("Cannot read %s (%s)" % [file_path, error_string(FileAccess.get_open_error())])
+		return null
+	var json := JSON.new()
+	if json.parse(text) != OK:
+		push_error("Cannot parse %s (line %d: %s)" % [file_path, json.get_error_line(), json.get_error_message()])
+		return null
+	return json.data
 
 ## The subscribed routes changed (replay loaded, line added): their stops, and one button each in the Lines panel
 func routes_updated():

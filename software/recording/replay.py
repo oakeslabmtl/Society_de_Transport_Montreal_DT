@@ -1,5 +1,4 @@
 import json
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from recording.paths import write_text_atomic
@@ -13,8 +12,6 @@ VERSION = 1
 
 # Godot needs these to place a bus; observations without them are skipped.
 REQUIRED_KEYS = ("vehicle.vehicle.id", "vehicle.trip.route_id", "vehicle.position.latitude", "vehicle.position.longitude")
-
-logger = logging.getLogger("Replay")
 
 
 @dataclass
@@ -30,12 +27,13 @@ def build_replay(store:RecordingStore, window:Window, name:str=None, routes:list
     meta = store.meta
     tz = meta["timezone"]
     wanted = {str(route) for route in routes} if routes else None
-    entities_by_poll = store.entities_by_poll(window.polls)
+    entities_by_poll = store.entities_by_poll(window.polls, sorted(wanted) if wanted else None)
 
     frames, vehicles, seen_routes, skipped = [], set(), set(), 0
     for poll in window.polls:
         data = []
         for entity in entities_by_poll[poll.poll_id]:
+            # Also filtered in SQL, except the rows whose route is not in the route_id column (see entities_by_poll)
             if wanted is not None and str(entity.get("vehicle.trip.route_id")) not in wanted:
                 continue
             if any(key not in entity for key in REQUIRED_KEYS):
@@ -45,9 +43,6 @@ def build_replay(store:RecordingStore, window:Window, name:str=None, routes:list
             vehicles.add(entity["vehicle.vehicle.id"])
             seen_routes.add(str(entity["vehicle.trip.route_id"]))
         frames.append({"t": round(poll.poll_time - window.start_time, 3), "data": data})
-
-    if skipped:
-        logger.warning(f"Skipped {skipped} observation(s) without vehicle id, route or position.")
 
     route_list = sort_routes(wanted or meta.get("route_ids") or seen_routes)
     replay = {

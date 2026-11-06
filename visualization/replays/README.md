@@ -1,6 +1,6 @@
 # Replays
 
-Every `*.json` file in this folder is bundled into the demo build (`build_demo.bat`) and listed in the viewer's replay menu. Make them with the recording tool (`python software\recording export ...`, see "Record & replay demo" in the root README). Files dropped later into the `replays\` folder next to `STM DT Demo.exe` are picked up at the next start, without a rebuild.
+Every `*.json` file in this folder is bundled into both builds and listed in the viewer's replay menu: the Windows demo (`build_demo.bat`) and the web version (`build_demo.bat --web` and the GitHub Pages workflow), where each visitor downloads all of them before the page starts. Make them with the recording tool (`python software\recording export ...`, see "Record & replay demo" in the root README). Files dropped later into the `replays\` folder next to `STM DT Demo.exe` are picked up at the next start, without a rebuild.
 
 Keep only real replays here: a broken `.json` is skipped at startup, but it still shows up in the menu.
 

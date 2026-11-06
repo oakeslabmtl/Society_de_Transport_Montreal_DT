@@ -179,22 +179,30 @@ def _read_trip_patterns(gtfs:Path, trips:dict, on_progress=None) -> tuple[dict[s
 
     rows = 0
     with _read_table(gtfs, "stop_times.txt") as (reader, binary, size):
-        for row in reader:
+        # Millions of rows, 3 columns read: plain lists from the DictReader's csv.reader (past the header), not dicts
+        trip_col, stop_col, seq_col = (reader.fieldnames.index(c) for c in ("trip_id", "stop_id", "stop_sequence"))
+        width = max(trip_col, stop_col, seq_col) + 1
+        lines = reader.reader       # its line_num: the DictReader's only follows the rows read through the DictReader
+        for row in lines:
+            if not row:     # a blank line: skipped, as the DictReader does
+                continue
+            if len(row) < width:    # the missing cells of a short row are "", as with the DictReader
+                row += [""] * (width - len(row))
             rows += 1
             if on_progress and rows % PROGRESS_ROWS == 0:
                 on_progress(rows, _fraction_read(binary, size))
-            trip_id = row["trip_id"]
+            trip_id = row[trip_col]
             if trip_id not in trips:
                 continue
             if trip_id != current_trip:
                 add(current_trip, current)
                 current_trip, current = trip_id, []
             try:
-                sequence = int(row["stop_sequence"])
+                sequence = int(row[seq_col])
             except (TypeError, ValueError):
-                raise RecordingError(f"stop_times.txt line {reader.line_num}: stop_sequence should be a whole number "
-                                     f"but is '{row['stop_sequence']}'.")
-            current.append((sequence, row["stop_id"]))
+                raise RecordingError(f"stop_times.txt line {lines.line_num}: stop_sequence should be a whole number "
+                                     f"but is '{row[seq_col]}'.")
+            current.append((sequence, row[stop_col]))
         add(current_trip, current)
     if on_progress:
         on_progress(rows, 1.0)

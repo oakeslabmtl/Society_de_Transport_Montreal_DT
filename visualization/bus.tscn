@@ -1,9 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://co3sluvl3vuyh"]
-
-[ext_resource type="Script" uid="uid://brv472g624cpr" path="res://scripts/bus.gd" id="1_f0ay3"]
-
-[node name="Bus" type="Node2D"]
-script = ExtResource("1_f0ay3")
-
-[node name="BusIcon" type="Sprite2D" parent="."]
-scale = Vector2(0.119205, 0.119205)

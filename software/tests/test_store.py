@@ -67,6 +67,22 @@ class StoreRoundTripTest(TempDirTestCase):
             result = store.entities_by_poll(store.polls())
         self.assertEqual(sum(len(entities) for entities in result.values()), POLLS_PER_QUERY + 5)
 
+    def test_entities_can_be_filtered_by_route(self):
+        # Rows without a route_id column must still reach the caller's filter: a route of an unexpected type
+        # (kept in extra_json) or no route at all
+        int_route = entity("c", "45", T0 - 3, **{"vehicle.trip.route_id": 45})
+        no_route = entity("d", "45", T0 - 5)
+        del no_route["vehicle.trip.route_id"]
+        path = make_recording(self.tmp / "r.sqlite", [(T0, [entity("a", "45", T0 - 9), entity("b", "121", T0 - 2),
+                                                            int_route, no_route])])
+        with RecordingStore.open(path) as store:
+            polls = store.polls()
+            filtered = store.entities_by_poll(polls, ["45"])[polls[0].poll_id]
+            everything = store.entities_by_poll(polls)[polls[0].poll_id]
+        self.assertEqual([e["id"] for e in filtered], ["c", "d", "a"])
+        self.assertEqual(typed(filtered[0]), typed(int_route))
+        self.assertEqual([e["id"] for e in everything], ["b", "c", "d", "a"])
+
     def test_poll_rows_and_vehicle_count(self):
         path = make_recording(self.tmp / "r.sqlite", [(T0, [entity("a", "45", T0)]), (T0 + 15, "HTTP 503 Service Unavailable")])
         with RecordingStore.open(path) as store:

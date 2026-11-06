@@ -1,6 +1,7 @@
 from pymongo.errors import BulkWriteError, ConnectionFailure
 from pymongo import MongoClient
 import logging
+import re
 
 
 class MongoDB:
@@ -29,36 +30,17 @@ class MongoDB:
     def setup(self):
         try:
             self.client = MongoClient(self.connection_str)
-            self.db_exists()
-            self.collection_exists()
+            self.client.admin.command("ping")   # Fails here, not at the first query, when MongoDB cannot be reached
+            # MongoDB creates the database and the collection at the first write
+            self.database = self.client[self.db_name]
             self.collection = self.database[self.col_name]
 
         except ConnectionFailure as e:
-            error_msg = f"Unable to connect to {self.connection_str}/{self.db_name}/{self.col_name}, error: {str(e)}"
+            # Without the user and password of the connection string (pymongo's own message names only the hosts)
+            address = re.sub(r"//[^@/]*@", "//", self.connection_str)
+            error_msg = f"Unable to connect to {address}/{self.db_name}/{self.col_name}, error: {e}"
             self.logger.error(error_msg)
-            raise ConnectionFailure(error_msg)
-
-
-    def db_exists(self):
-        if self.client and self.db_name in self.client.list_database_names():
-            self.database = self.client[self.db_name]
-            self.logger.info(f"{self.db_name} database exists.")
-        else:
-            self.database = self.client[self.db_name]
-            self.logger.error(f"ec{self.db_name} database did not exist.")
-
-
-    def collection_exists(self):
-        if self.database is None:
-            self.database = self.client[self.db_name]
-
-        if self.col_name in self.database.list_collection_names():
-            self.logger.info(f"{self.col_name} collection exists in database {self.db_name}.")
-            self.collection = self.database[self.col_name]
-        else:
-            self.logger.error(f"{self.col_name} collection did not exist in database {self.db_name}.")
-            self.logger.info(f"Creating collection {self.col_name} in database {self.db_name}.")
-            self.collection = self.database[self.col_name]
+            raise ConnectionFailure(error_msg) from e
 
 
     def save(self, data: list[dict]):
@@ -78,13 +60,5 @@ class MongoDB:
 
 
     def find(self, _filter: dict):
-        try:
-            self.logger.debug(f"Start fetch from db for {_filter} ... ")
-
-            results = self.collection.find(_filter)
-
-            self.logger.debug(f"End fetch with results: {results}")
-
-            return results
-        except BulkWriteError as e:
-            self.logger.error(f"Error: {str(e)}")
+        self.logger.debug(f"Fetching from the database: {_filter}")
+        return self.collection.find(_filter)    # A cursor: the query runs as it is read

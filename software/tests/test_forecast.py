@@ -330,8 +330,7 @@ class ComputeTest(unittest.TestCase):
         # An infinity must be dropped like a NaN, not clipped into "Full"/"Empty"
         nan_for_b_inf_for_c = lambda context, length, quantiles: np.stack(
             [np.full((3, length), 1.0), np.full((3, length), NaN), np.full((3, length), math.inf)]).astype(np.float32)
-        with self.assertLogs("Forecast", "WARNING"):
-            result = compute_forecast(plan, FakeForecaster(fn=nan_for_b_inf_for_c))
+        result = compute_forecast(plan, FakeForecaster(fn=nan_for_b_inf_for_c))
         self.assertEqual((list(result.forecast["vehicles"]), result.skipped), (["a"], 4))
         with self.assertRaisesRegex(RecordingError, r"returned an array of shape \(3, 3, 39\), expected \(3, 3, 40\)"):
             compute_forecast(plan, FakeForecaster(fn=lambda context, length, quantiles: np.zeros((3, 3, length - 1))))

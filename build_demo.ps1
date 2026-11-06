@@ -17,8 +17,8 @@
 
     Before it is shared, the build is checked (software\tools\check_export.py, with the repository's
     .venv Python, else Python 3.10 or newer on the PATH): when STM_API_KEY is set on this computer, no
-    file of the build or of the project may contain its value, and neither the pack nor the project's
-    files may hold a secret-like file or API-key wording.
+    file of the build or of the project may contain its value, the pack may not hold a secret-like
+    file, and neither the pack nor the project's files may hold API-key wording.
 
 .PARAMETER Godot
     Path to the Godot 4.7 .NET (mono) editor (with -Web: the standard Godot 4.7, not .NET), preferably
@@ -430,7 +430,7 @@ try {
     }
 
     if (-not $Web) {
-        Write-Step "4/$steps Adding the replays folder (drop-in replays, no rebuild) and the safe-mode launcher"
+        Write-Step "4/$steps Adding the replays folder (drop-in replays, no rebuild), the safe-mode launcher and the credits"
         $dropDir = Join-Path $DemoDir "replays"
         New-Item -ItemType Directory -Force -Path $dropDir | Out-Null
         [IO.File]::WriteAllText((Join-Path $dropDir "README.md"), $ReplaysReadme.Replace("`r`n", "`n").Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
@@ -438,6 +438,9 @@ try {
         $safeModePath = Join-Path $DemoDir "Start in safe mode.bat"
         [IO.File]::WriteAllText($safeModePath, $SafeModeBat.Replace("`r`n", "`n").Replace("`n", "`r`n") + "`r`n", (New-Object Text.ASCIIEncoding))
         Write-Host "   $safeModePath"
+        # The bus model's CC BY licence asks for its credit wherever it is shared
+        Copy-Item -LiteralPath (Join-Path $Project "credits.txt") -Destination $DemoDir -Force
+        Write-Host "   $(Join-Path $DemoDir 'credits.txt')"
     }
 
     # The key's value reaches the checker through the environment only (never on a command line)

@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         "forecast", parents=[common], formatter_class=formatter,
         help="add occupancy forecasts to a replay (Timestral, or the location model)",
         description="Precompute occupancy forecasts with Timestral (a time-series model by Mistral AI) and store them in the\n"
-                    "replay, for the chart shown when a bus is selected in the viewer (the demo exe runs no model).\n"
+                    "replay, for the chart shown when a bus is selected in the viewer (the viewer runs no model).\n"
                     "Every --every-minutes of replay time, each bus with --min-history-minutes of occupancy history gets a\n"
                     "forecast of the next --horizon-minutes, made only from what was observed until then. With Timestral,\n"
                     "each forecast point is then calibrated on the earlier forecasts whose outcome is known (walk-forward):\n"
@@ -156,8 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
     forecast.add_argument("replay", metavar="REPLAY", help="the replay .json (rewritten in place)")
     forecast.add_argument("--model", default="28M", help="Timestral size: 5M, 28M, 123M or 209M (downloaded once: 21 MB "
                                                          "to 837 MB), a Hugging Face repo id or a model folder, or "
-                                                         f"'{LOCATION_MODEL}' for the location model (a model folder "
-                                                         f"named {LOCATION_MODEL}: .\\{LOCATION_MODEL}) "
+                                                         f"'{LOCATION_MODEL}' for the location model (numpy only; to load "
+                                                         f"a model folder named {LOCATION_MODEL}, pass .\\{LOCATION_MODEL}) "
                                                          "(default: %(default)s)")
     forecast.add_argument("--horizon-minutes", type=float, default=10,
                           help="how far ahead each forecast goes (default: %(default)g)")
@@ -273,6 +273,8 @@ def run_import_csv(args) -> int:
 def run_info(args) -> int:
     from recording.info import describe
 
+    if args.minutes <= 0:
+        raise RecordingError("--minutes must be greater than 0.")
     with RecordingStore.open(args.recording) as store:
         lines, best = describe(store, minutes=args.minutes)
         tz = store.meta["timezone"]
@@ -297,6 +299,13 @@ def run_export(args) -> int:
         polls = store.polls("ok")
         start = parse_local_time(args.start, tz, polls) if args.start and polls else None
         window, warnings = select_window(polls, meta["poll_interval_s"], tz, start, args.minutes)
+        # Checked before the replay is built: that reads every position of the window
+        out = Path(args.out) if args.out else REPLAYS_DIR / default_replay_file_name(args.recording, window, tz)
+        if out.suffix.lower() != ".json":
+            raise RecordingError(f"--out must end with .json (the viewer only looks for *.json files): {out}")
+        replaced = out.exists()
+        if replaced and not args.force:
+            raise RecordingError(f"{display_path(out)} already exists. Choose another --out, or add --force to replace it.")
         routes = parse_routes(args.routes) if args.routes else None
         if routes:
             recorded = [route for route in store.route_counts() if route]
@@ -307,13 +316,9 @@ def run_export(args) -> int:
             if unknown:
                 warnings.append(f"Route(s) {', '.join(unknown)} are not in this recording.")
         result = build_replay(store, window, args.name, routes)
+        if result.skipped:
+            warnings.append(f"Skipped {result.skipped} observation(s) without vehicle id, route or position.")
 
-    out = Path(args.out) if args.out else REPLAYS_DIR / default_replay_file_name(args.recording, window, tz)
-    if out.suffix.lower() != ".json":
-        raise RecordingError(f"--out must end with .json (the viewer only looks for *.json files): {out}")
-    replaced = out.exists()
-    if replaced and not args.force:
-        raise RecordingError(f"{display_path(out)} already exists. Choose another --out, or add --force to replace it.")
     size = write_replay(result.replay, out)
 
     for warning in warnings:
@@ -326,11 +331,14 @@ def run_export(args) -> int:
         return forecast_exported_replay(out)
     print("\nNext steps:")
     if out.resolve().parent == REPLAYS_DIR.resolve():
-        print("  - It is in visualization/replays/, so the next demo build includes it: run .\\build_demo.bat at the repo root.")
+        print("  - It is in visualization/replays/, so the next builds include it. At the repo root, .\\build_demo.bat builds")
+        print("    the desktop demo and .\\build_demo.bat --web the web version (or commit the file and run the 'Web version'")
+        print("    workflow on GitHub).")
     else:
-        print("  - To bundle it in the demo, put it in visualization/replays/ and run .\\build_demo.bat at the repo root.")
-    print("  - No rebuild needed: copy it into the replays folder next to \"STM DT Demo.exe\" in an unzipped demo;")
-    print("    it shows up in the viewer's replay list.")
+        print("  - To bundle it, put it in visualization/replays/ and run .\\build_demo.bat at the repo root (desktop demo)")
+        print("    or .\\build_demo.bat --web (web version).")
+    print("  - Desktop demo only, no rebuild needed: copy it into the replays folder next to \"STM DT Demo.exe\" in an")
+    print("    unzipped demo; it shows up in the viewer's replay list.")
     print("  - Optional: add occupancy forecasts for the viewer's bus chart (with the forecast environment, see forecast --help):")
     print(f'      {forecast_program()} forecast "{display_path(out)}"')
     return 0
@@ -473,7 +481,7 @@ def save_forecast(path:Path, replay:dict, result, model:str, details:list[str], 
 
     metrics = result.metrics
     ahead = f"  at +{_minutes_text(result.forecast['horizon'])}"
-    print(f"\n  {'':<18}" + "".join(f"{name:>22}" for name, _ in columns) + f"{chr(34) + 'no change' + chr(34):>14}")
+    print(f"\n  {'':<18}" + "".join(f"{name:>22}" for name, _ in columns) + '"no change"'.rjust(14))
     for label, key, baseline, text in (("right", "accuracy", "accuracy_last_value", _accuracy_text),
                                        (ahead, "accuracy_at_horizon", "accuracy_last_value_at_horizon", _accuracy_text),
                                        ("error (steps)", "mae", "mae_last_value", _level_text),
@@ -486,12 +494,15 @@ def save_forecast(path:Path, replay:dict, result, model:str, details:list[str], 
           f"apart:\n  {scale}.\n  \"Right\": the median rounded to a status is the observed one. \"No change\" repeats the "
           f"last observed status\n  (its 80% range would have zero width): occupancy changes rarely, so it is hard to beat.")
     if path.resolve().parent == REPLAYS_DIR.resolve():
-        print_next_step("rebuild the demo so that it includes the forecast", ".\\build_demo.bat   (at the repo root)",
-                        '(or, without a rebuild, copy the file into the replays folder next to "STM DT Demo.exe" in an unzipped demo)')
+        print_next_step("rebuild so that the builds include the forecast (at the repo root)",
+                        ".\\build_demo.bat          the desktop demo\n"
+                        "  .\\build_demo.bat --web    the web version (or commit the file and run the 'Web version' workflow on GitHub)",
+                        '(desktop demo only, no rebuild: copy the file into the replays folder next to "STM DT Demo.exe" in an unzipped demo)')
     else:
-        print_next_step("see it in the viewer (no rebuild needed)",
+        print_next_step("see it in the desktop demo (no rebuild needed)",
                         'copy the file into the replays folder next to "STM DT Demo.exe" in an unzipped demo',
-                        "(or put it in visualization\\replays\\ and run .\\build_demo.bat at the repo root to bundle it)")
+                        "(or put it in visualization\\replays\\ and run .\\build_demo.bat at the repo root to bundle it; "
+                        "--web for the web version)")
     return 0
 
 
@@ -519,10 +530,13 @@ def run_route_stops(args) -> int:
           f"{result.stop_times:,} stop times in {time.monotonic() - started:.0f} s")
     print(f"  stops:    {result.stops:,}")
     if out.resolve() == ROUTE_STOPS_FILE.resolve():
-        print_next_step("rebuild the demo so that it includes them", ".\\build_demo.bat   (at the repo root)")
+        print_next_step("rebuild so that the builds include them (at the repo root)",
+                        ".\\build_demo.bat          the desktop demo\n"
+                        "  .\\build_demo.bat --web    the web version (or commit the file and run the 'Web version' workflow on GitHub)")
     else:
         print_next_step("let the viewer use them", f"copy the file to {display_path(ROUTE_STOPS_FILE)}",
-                        "(then run .\\build_demo.bat at the repo root to bundle it in the demo)")
+                        "(then run .\\build_demo.bat at the repo root to bundle it in the desktop demo, or .\\build_demo.bat "
+                        "--web for the web version)")
     return 0
 
 

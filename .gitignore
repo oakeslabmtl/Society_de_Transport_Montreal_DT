@@ -172,7 +172,11 @@ cython_debug/
 
 .idea/
 *.conf
-!services/configs/*.conf
+# The notebooks write services/configs/*_service.conf, with credentials: never tracked
+!services/configs/logging.conf
+# Also written by the notebooks (%%writefile), each time they run
+/services/notification_service.py
+/services/telemetry_validation_service.py
 
 # Record & replay: demo build output (build_demo.bat) and local recordings
 # (CSV imports are regenerable; live `record` captures are not: keep a copy, see README)
@@ -180,3 +184,7 @@ cython_debug/
 /recordings/
 # Separate environment for `python software/recording forecast` (Timestral + PyTorch, see the README)
 /.venv-forecast/
+
+# Personal documents and Godot's .csproj backups
+/*.docx
+*.csproj.old*
