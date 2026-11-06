@@ -7,6 +7,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable
 import requests
+from communication.api_key import redact_key
 from recording import RecordingError
 from recording.store import RecordingStore, dedupe_by_vehicle, vehicle_key
 
@@ -46,7 +47,7 @@ class RecordResult:
 
 def stm_fetcher(route_ids:list[int], timeout:float) -> tuple[Fetcher, str]:
     """Fetcher for the live STM API, same filtering/flattening as the DataIngestionService. Returns (fetch, url)."""
-    if not os.environ.get("STM_API_KEY"):
+    if not os.environ.get("STM_API_KEY", "").strip():
         raise RecordingError(MISSING_KEY)
     try:
         from communication.protocol import STM_API_URL, STM_API_HEADER
@@ -64,6 +65,9 @@ def stm_fetcher(route_ids:list[int], timeout:float) -> tuple[Fetcher, str]:
 
 def describe_error(error:Exception) -> str:
     """Short, key-free description of a failed fetch."""
+    if isinstance(error, requests.exceptions.InvalidHeader):
+        # requests puts the rejected header value, i.e. the key, in this message
+        return "the STM_API_KEY value is malformed (whitespace or line break?)"
     if isinstance(error, requests.HTTPError) and error.response is not None:
         status = error.response.status_code
         hint = " (check that STM_API_KEY is valid)" if status in (401, 403) else ""
@@ -74,7 +78,7 @@ def describe_error(error:Exception) -> str:
         return "cannot reach the STM API (no network?)"
     if type(error).__name__ == "DecodeError":
         return "the answer was not a GTFS-realtime feed"
-    return f"{type(error).__name__}: {error}"
+    return redact_key(f"{type(error).__name__}: {error}")
 
 
 def record(store:RecordingStore, fetch:Fetcher, interval:float, minutes:float=None,

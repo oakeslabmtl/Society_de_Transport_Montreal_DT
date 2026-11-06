@@ -2,7 +2,7 @@ import json
 import os
 
 STM_API_URL = "https://api.stm.info/pub/od/gtfs-rt/ic/v2/vehiclePositions"
-STM_API_HEADER = {'apiKey': os.environ["STM_API_KEY"], 'Accept': 'application/x-protobuf'}
+STM_API_HEADER = {'apiKey': os.environ["STM_API_KEY"].strip(), 'Accept': 'application/x-protobuf'}
 ENCODING = "ascii"
 
 ROUTING_KEY_STM_BUS_ROUTE_UPDATES = "stm.bus.routes.updates"

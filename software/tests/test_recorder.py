@@ -1,4 +1,5 @@
 import contextlib
+import importlib.util
 import io
 import os
 import re
@@ -6,10 +7,10 @@ import sqlite3
 import unittest
 from unittest import mock
 import requests
-from fixtures import T0, TempDirTestCase, entity, typed
+from fixtures import SOFTWARE_DIR, T0, TempDirTestCase, entity, typed
 from recording import RecordingError
 from recording.cli import main, progress_line
-from recording.recorder import describe_error, record
+from recording.recorder import describe_error, record, stm_fetcher
 from recording.store import RecordingStore
 
 
@@ -147,6 +148,32 @@ class RecorderErrorsTest(TempDirTestCase):
         message = describe_error(requests.HTTPError(response=response))
         self.assertEqual(message, "HTTP 403 Forbidden (check that STM_API_KEY is valid)")
         self.assertEqual(describe_error(requests.Timeout()), "the STM API did not answer in time")
+
+    def test_a_malformed_api_key_is_never_in_the_error(self):
+        raw = "dummy-key-for-tests\n"      # e.g. pasted with its line break; never the real key
+        with mock.patch.dict(os.environ, {"STM_API_KEY": raw}):
+            with self.assertRaises(requests.exceptions.InvalidHeader) as caught:
+                requests.Request("GET", "https://example.test/feed", headers={"apiKey": raw}).prepare()
+            message = describe_error(caught.exception)
+            fallback = describe_error(ValueError(f"bad header {raw!r} / {raw.strip()}"))
+        self.assertIn("dummy-key-for-tests", str(caught.exception))         # what requests would have let leak
+        self.assertEqual(message, "the STM_API_KEY value is malformed (whitespace or line break?)")
+        self.assertEqual(fallback, "ValueError: bad header '<STM_API_KEY>' / <STM_API_KEY>")
+        for text in (message, fallback):
+            self.assertNotIn("dummy-key-for-tests", text)
+
+    def test_a_blank_api_key_hides_nothing_and_counts_as_missing(self):
+        with mock.patch.dict(os.environ, {"STM_API_KEY": " \r\n"}):
+            self.assertEqual(describe_error(ValueError("boom\n")), "ValueError: boom\n")
+            with self.assertRaisesRegex(RecordingError, "STM_API_KEY is not set"):
+                stm_fetcher([45], timeout=1)
+
+    def test_the_api_key_is_stripped_where_it_is_read(self):
+        spec = importlib.util.spec_from_file_location("protocol_under_test", SOFTWARE_DIR / "communication" / "protocol.py")
+        protocol = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(os.environ, {"STM_API_KEY": " dummy-key-for-tests\r\n"}):
+            spec.loader.exec_module(protocol)      # a fresh copy: communication.protocol itself is left as it was
+        self.assertEqual(protocol.STM_API_HEADER["apiKey"], "dummy-key-for-tests")
 
     def test_record_without_api_key_is_a_friendly_error(self):
         environment = {k: v for k, v in os.environ.items() if k != "STM_API_KEY"}

@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -11,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 import fixtures  # noqa: F401  (puts software/ on sys.path)
 import pandas as pd
+import requests
 from google.transit.gtfs_realtime_pb2 import FeedMessage
 from protobuf_to_dict import protobuf_to_dict
 from communication import stm_api
@@ -159,6 +162,30 @@ class StmApiGoldenTest(unittest.TestCase):
         nested = reference_process_response(self.feed, None, flatten=False)
         self.assertEqual(as_json(flatten_response(nested)), as_json(reference_flatten_response(nested)))
         self.assertEqual(to_queue_format([])["source"], "stm_api_bus_routes_update")
+
+    def test_data_ingestion_service_logs_errors_without_the_api_key(self):
+        os.environ.setdefault("STM_API_KEY", "dummy-key-for-tests")
+        try:
+            with mock.patch("config.config.config_logger"):
+                from startup.data_ingestion_service import DataIngestionService
+        except ImportError as error:
+            self.skipTest(f"service dependencies not installed: {error}")
+
+        raw = "dummy-key\r\nfor-tests"          # a line break inside: the strip in protocol.py cannot fix it; never the real key
+        with self.assertRaises(requests.exceptions.InvalidHeader) as caught:
+            requests.Request("GET", "https://example.test/feed", headers={"apiKey": raw}).prepare()
+        service = object.__new__(DataIngestionService)       # no RabbitMQ / MongoDB connection
+        service.logger = service._logger = logging.getLogger("DataIngestionServiceLogTest")
+        service.channel = None                                # what RabbitMQ.__del__ looks at
+        with mock.patch.dict(os.environ, {"STM_API_KEY": raw}), \
+                mock.patch.object(service, "fetch_and_update_route", side_effect=caught.exception), \
+                self.assertLogs("DataIngestionServiceLogTest", "ERROR") as logs, \
+                contextlib.redirect_stderr(io.StringIO()) as stderr, self.assertRaises(SystemExit):
+            service.ingest()
+        self.assertIn("header value: '<STM_API_KEY>'", logs.output[0])
+        for text in (logs.output[0], stderr.getvalue()):     # the log line, and the traceback printed after it
+            self.assertNotIn("dummy-key", text)
+            self.assertNotIn("for-tests", text)
 
     def test_live_service_keeps_the_stm_api_error_logs(self):
         # logging.conf (fileConfig) disables the loggers that exist when it is loaded, like "StmApi" (created on import)

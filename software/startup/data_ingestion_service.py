@@ -6,6 +6,7 @@ from communication.rpc_server import RPCServer
 from communication.mongodb import MongoDB
 from communication.protocol import ROUTING_KEY_STM_TELEMETRY_VALIDATION, ROUTING_KEY_STM_BUS_ROUTE_UPDATES, STM_API_URL, STM_API_HEADER, EXECUTION_INTERVAL
 from communication.stm_api import fetch_feed, extract_timestamp, filter_vehicle_entities, flatten_entities
+from communication.api_key import redact_key
 
 config_logger("config/logging.conf")
 
@@ -121,7 +122,8 @@ class DataIngestionService(RPCServer):
                 exit(0)
 
             except Exception as e:
-                self.logger.error(f"The following exception occurred: {e}")
+                # e.g. requests.exceptions.InvalidHeader quotes the rejected apiKey header value
+                self.logger.error(redact_key(f"The following exception occurred: {e}"))
                 traceback.print_tb(e.__traceback__)
                 exit(0)
 
