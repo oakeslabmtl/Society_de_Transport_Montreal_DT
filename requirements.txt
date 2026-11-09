@@ -1,3 +1,38 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:e8d6cf4dca13cf4f3c6ee3f4093789805adb898bac93977a799e4e08fb3ff1e3
-size 158
+beautifulsoup4
+certifi
+charset-normalizer
+contourpy
+cycler
+dnspython
+docker
+fonttools
+google
+gtfs-realtime-bindings
+idna
+kiwisolver
+matplotlib
+mpmath
+narwhals
+numpy
+packaging
+pandas
+pika
+pillow
+plotly
+protobuf<7
+protobuf3-to-dict
+pyhocon
+pymongo
+pyparsing
+python-dateutil
+pytz
+pywin32; sys_platform == "win32"
+requests
+scipy
+setuptools
+six
+soupsieve
+sympy
+typing_extensions
+tzdata
+urllib3

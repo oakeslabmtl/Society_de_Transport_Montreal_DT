@@ -8,11 +8,15 @@
 
 config_version=5
 
+[animation]
+
+compatibility/default_parent_skeleton_in_mesh_instance_3d=true
+
 [application]
 
 config/name="STM DT"
 run/main_scene="uid://c71j6ed8bjn6u"
-config/features=PackedStringArray("4.5", "C#", "Forward Plus")
+config/features=PackedStringArray("4.7", "C#", "Forward Plus")
 boot_splash/show_image=false
 config/icon="res://assets/logo.png"
 
@@ -27,7 +31,7 @@ project/assembly_name="Below MTL"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/godot_3d_auto_collision_generator/plugin.cfg")
+enabled=PackedStringArray()
 
 [input]
 

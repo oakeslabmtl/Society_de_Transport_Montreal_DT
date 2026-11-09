@@ -86,22 +86,14 @@ class RabbitMQ:
         return created_queue_name
 
 
-    def queues_delete(self):
-        self.queue_name = list(set(self.queue_name))
-        for name in self.queue_name:
-            self._logger.debug(f"Deleting queue:{name}")
-            self.channel.queue_unbind(queue=name, exchange=self.exchange_name)
-            self.channel.queue_delete(queue=name)
-
     def close(self):
-        self._logger.debug("Deleting created queues by Rabbitmq class")
-        self.queues_delete()
-
-        self._logger.debug("Closing channel in rabbitmq")
-        self.channel.close()
-
-        self._logger.debug("Closing connection in rabbitmq")
-        self.connection.close()
+        # The queues declare_local_queue makes are exclusive: the broker deletes them, and their bindings, with the
+        # connection. Closing a channel or a connection that is already closed raises, and would hide the error that
+        # dropped it: nothing to do then
+        connection = getattr(self, "connection", None)
+        if connection is not None and connection.is_open:
+            self._logger.debug("Closing the RabbitMQ connection")
+            connection.close()
 
 
     def subscribe(self, routing_key, on_message_callback):

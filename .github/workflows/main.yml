@@ -1,0 +1,122 @@
+# Builds the web version of the viewer (visualization/: replays only, no live feed) and publishes it on GitHub Pages,
+# https://oakeslabmtl.github.io/Society_de_Transport_Montreal_DT/
+# Started by hand only: Actions > Web version > Run workflow, on master. One-time setup, limits and the same build on a
+# computer (build_demo.ps1 -Web): README, "Web version".
+name: Web version
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One publication at a time; one that has started is not cancelled
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  GODOT_VERSION: 4.7.1
+  GODOT_RELEASE: 4.7.1-stable
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+      # First: a repository without Pages fails here, before any download
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # Of the files in Git LFS, the viewer needs its 3D models only (the map is 75 MB). They are cached: the
+      # organization's LFS bandwidth is limited. It is spent again when a model changes, or when no run used the cache
+      # for 7 days (GitHub then deletes it)
+      - name: List the viewer's models in Git LFS
+        run: git lfs ls-files --long --include="visualization/assets/*.glb" | cut -d' ' -f1 | sort > .lfs-oids
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .git/lfs/objects
+          key: lfs-viewer-${{ hashFiles('.lfs-oids') }}
+      - name: Fetch the viewer's models
+        run: |
+          git lfs pull --include="visualization/assets/*.glb"
+          # A Git LFS pointer instead of the map would export an empty city
+          size=$(stat -c%s "visualization/assets/map not joined.glb")
+          if [ "$size" -lt 1000000 ]; then echo "::error::The map is a Git LFS pointer ($size bytes), not the map"; exit 1; fi
+
+      # The standard Godot, not .NET: the .NET editor cannot export to the web. Only its single-threaded web templates
+      # are kept (GitHub Pages cannot send the headers a multi-threaded page needs). Cached like the models (7 days)
+      - name: Cache Godot and its web templates
+        id: godot-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/godot
+            ~/.local/share/godot/export_templates/${{ env.GODOT_VERSION }}.stable
+          key: godot-${{ env.GODOT_RELEASE }}-web-nothreads
+      - name: Download Godot and its web templates
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          base="https://github.com/godotengine/godot-builds/releases/download/$GODOT_RELEASE"
+          editor="Godot_v${GODOT_RELEASE}_linux.x86_64"
+          templates="Godot_v${GODOT_RELEASE}_export_templates.tpz"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -O "$base/$editor.zip" -O "$base/$templates" -O "$base/SHA512-SUMS.txt"
+          # The official checksums of both files
+          awk -v a="$editor.zip" -v b="$templates" '$2 == a || $2 == b' SHA512-SUMS.txt > sums.txt
+          [ "$(wc -l < sums.txt)" -eq 2 ]
+          sha512sum -c sums.txt
+          mkdir -p ~/godot
+          unzip -q -o "$editor.zip" -d ~/godot
+          mv ~/godot/"$editor" ~/godot/godot
+          chmod +x ~/godot/godot
+          dir=~/.local/share/godot/export_templates/"$GODOT_VERSION".stable
+          mkdir -p "$dir"
+          unzip -q -j -o "$templates" templates/web_nothreads_release.zip templates/web_nothreads_debug.zip \
+            templates/version.txt -d "$dir"
+          rm "$editor.zip" "$templates"
+
+      - name: Import the project
+        run: |
+          # Godot must not import the builds (a .gdignore in Build/, as build_demo.ps1 makes it)
+          mkdir -p visualization/Build/Web
+          touch visualization/Build/.gdignore
+          ~/godot/godot --headless --path visualization --import
+      - name: Export the web version
+        run: |
+          set -o pipefail
+          ~/godot/godot --headless --path visualization --export-release "Web" Build/Web/index.html 2>&1 | tee "$RUNNER_TEMP/export.log"
+          for file in index.html index.js index.wasm index.pck; do
+            if [ ! -s "visualization/Build/Web/$file" ]; then echo "::error::The export made no $file"; exit 1; fi
+          done
+          # The replay is the page's only data (build_demo.ps1 makes the same check)
+          if ! grep -q 'Storing File: res://replays/.*\.json' "$RUNNER_TEMP/export.log"; then
+            echo "::error::The export packed no replay (include_filter of the Web preset): the page would show no buses"; exit 1
+          fi
+          # The map alone is about 75 MB of the pack
+          size=$(stat -c%s visualization/Build/Web/index.pck)
+          if [ "$size" -lt 80000000 ]; then echo "::error::index.pck is $size bytes: the map is missing"; exit 1; fi
+          ls -l visualization/Build/Web
+      # No STM_API_KEY here (this workflow has no secret): the pack and the project's files are checked for secret-like
+      # files and key wording
+      - name: Check the build
+        run: python3 -I software/tools/check_export.py visualization/Build/Web --project=visualization
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: visualization/Build/Web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,11 +1,14 @@
 [gd_scene load_steps=2 format=3 uid="uid://c6cmvgqwfkmsx"]
 
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_dygp6"]
-albedo_color = Color(0.22, 0.87, 1, 1)
-
-[node name="KeyPoint" type="Node3D"]
-
-[node name="CSGCylinder3D" type="CSGCylinder3D" parent="."]
-transform = Transform3D(0.995521, 0, 0, 0, 0.965445, 0, 0, 0, 0.996033, 0, 0, 0)
+[sub_resource type="CylinderMesh" id="CylinderMesh_pole"]
+top_radius = 0.5
+bottom_radius = 0.5
 height = 200.0
-material = SubResource("StandardMaterial3D_dygp6")
+radial_segments = 8
+rings = 0
+
+[node name="BusStop" type="Node3D"]
+
+[node name="Pole" type="MeshInstance3D" parent="."]
+transform = Transform3D(0.995521, 0, 0, 0, 0.965445, 0, 0, 0, 0.996033, 0, 0, 0)
+mesh = SubResource("CylinderMesh_pole")
