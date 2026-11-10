@@ -3,7 +3,7 @@ Project for a digital twin (DT) for the Société de Transport de Montréal (STM
 
 A student project (Polytechnique Montréal, LOG6953FE), not affiliated with or endorsed by the STM. It shows STM buses on a 3D map of downtown Montréal, live or from a recorded hour, with their occupancy and occupancy forecasts.
 
-- **See it without installing anything**: the [web version](https://oakeslabmtl.github.io/Society_de_Transport_Montreal_DT/) (once published), or the Windows demo (see [Record & replay demo](#record--replay-demo)).
+- **See it without installing anything**: the [web version](https://oakeslabmtl.github.io/Society_de_Transport_Montreal_DT/), or the Windows demo (see [Record & replay demo](#record--replay-demo)).
 
 ## Pre-Requisites
 
